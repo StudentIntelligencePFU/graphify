@@ -27,36 +27,207 @@ def _norm_ident(name: str) -> str:
     return ".".join(parts)
 
 
+import os
+
+def _read_sql_safe(path: Path) -> str:
+    """Read text handling Windows extended-length long paths (>260 chars)."""
+    p_str = str(path)
+    if os.name == "nt" and not p_str.startswith("\\\\?\\"):
+        try:
+            abs_p = os.path.abspath(p_str)
+            p_str = "\\\\?\\UNC\\" + abs_p[2:] if abs_p.startswith("\\\\") else "\\\\?\\" + abs_p
+        except Exception:
+            pass
+    with open(p_str, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _clean_sql_ident(ident: str) -> str:
+    """Strip brackets/quotes and return clean identifier."""
+    raw = ident.strip()
+    parts = []
+    for p in raw.split("."):
+        p = p.strip()
+        if p.startswith("[") and p.endswith("]"):
+            p = p[1:-1]
+        elif p.startswith('"') and p.endswith('"'):
+            p = p[1:-1]
+        elif p.startswith("`") and p.endswith("`"):
+            p = p[1:-1]
+        parts.append(p.strip())
+    return ".".join(parts)
+
+
+def _extract_sql_deterministic(path: Path, text: str) -> dict:
+    """Extract DDL tables, views, stored procedures and data lineage using regex."""
+    stem = _file_stem(path)
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
+                          "source_file": str_path, "source_location": None}]
+    edges: list[dict] = []
+    seen_ids: set[str] = {file_nid}
+
+    def _add_node(nid: str, label: str, line: int = 1) -> str:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}"})
+            edges.append({"source": file_nid, "target": nid, "relation": "contains",
+                          "confidence": "EXTRACTED", "source_file": str_path,
+                          "source_location": f"L{line}", "weight": 1.0})
+        return nid
+
+    def _add_edge(src: str, tgt: str, relation: str, line: int = 1, context: str | None = None) -> None:
+        if not src or not tgt or src == tgt:
+            return
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": "EXTRACTED", "source_file": str_path,
+                "source_location": f"L{line}", "weight": 1.0}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    def _ref_stub(name: str) -> str:
+        nid = _make_id(name)
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": name, "file_type": "code",
+                          "source_file": "", "source_location": "",
+                          "type": "namespace"})
+        return nid
+
+    # Strip SQL comments
+    clean_text = re.sub(r"--.*", "", text)
+    clean_text = re.sub(r"/\*.*?\*/", "", clean_text, flags=re.DOTALL)
+
+    # Regex for SQL identifier: [schema].[(Dim)_Name] or schema.name or [name]
+    _IDENT_RE = r"((?:\[[^\]]+\]|[a-zA-Z0-9_#$]+)(?:\.(?:\[[^\]]+\]|[a-zA-Z0-9_#$]+))*)"
+
+    # 1. Stored Procedures: CREATE (OR ALTER) PROCEDURE [schema].[proc_name]
+    sp_matches = list(re.finditer(
+        rf"CREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?PROCEDURE\s+{_IDENT_RE}",
+        clean_text, re.IGNORECASE,
+    ))
+
+    # 2. Views: CREATE (OR ALTER) VIEW [schema].[view_name]
+    view_matches = list(re.finditer(
+        rf"CREATE\s+(?:OR\s+(?:ALTER|REPLACE)\s+)?VIEW\s+{_IDENT_RE}",
+        clean_text, re.IGNORECASE,
+    ))
+
+    # 3. Tables: CREATE TABLE [schema].[table_name] (...)
+    tbl_matches = list(re.finditer(
+        rf"CREATE\s+TABLE\s+{_IDENT_RE}\s*\((.*?)\)(?:\s*;|\s+ON|\s+WITH|\s*$)",
+        clean_text, re.IGNORECASE | re.DOTALL,
+    ))
+
+    if sp_matches:
+        for m in sp_matches:
+            raw_sp = m.group(1).strip()
+            sp_name = _clean_sql_ident(raw_sp)
+            line_num = text[: m.start()].count("\n") + 1
+            sp_nid = _add_node(_make_id(stem, sp_name), f"{sp_name}()", line_num)
+
+            # Analyze writes (INSERT, UPDATE, TRUNCATE, DELETE, MERGE)
+            for wm in re.finditer(rf"\b(?:INSERT\s+INTO|TRUNCATE\s+TABLE|UPDATE|MERGE\s+INTO)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
+                target_raw = wm.group(1).strip()
+                if target_raw.upper() not in ("TOP", "OUTPUT", "SET", "DEFAULT"):
+                    target_tbl = _clean_sql_ident(target_raw)
+                    if target_tbl and target_tbl.lower() != sp_name.lower() and not target_tbl.startswith("@"):
+                        tgt_nid = _ref_stub(target_tbl)
+                        _add_edge(sp_nid, tgt_nid, "writes_to", line_num)
+
+            # Analyze reads (FROM, JOIN)
+            for rm in re.finditer(rf"\b(?:FROM|JOIN)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
+                src_raw = rm.group(1).strip()
+                if src_raw.upper() not in ("OPENROWSET", "STRING_SPLIT", "SELECT", "VALUES"):
+                    src_tbl = _clean_sql_ident(src_raw)
+                    if src_tbl and src_tbl.lower() != sp_name.lower() and not src_tbl.startswith("@"):
+                        src_nid = _ref_stub(src_tbl)
+                        _add_edge(sp_nid, src_nid, "reads_from", line_num)
+
+            # Analyze sub-procedure calls (EXEC, EXECUTE)
+            for em in re.finditer(rf"\b(?:EXEC|EXECUTE)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
+                call_raw = em.group(1).strip()
+                if call_raw.upper() not in ("SP_EXECUTESQL",):
+                    call_sp = _clean_sql_ident(call_raw)
+                    if call_sp and call_sp.lower() != sp_name.lower() and not call_sp.startswith("@"):
+                        call_nid = _ref_stub(f"{call_sp}()")
+                        _add_edge(sp_nid, call_nid, "calls", line_num)
+
+    elif view_matches:
+        for m in view_matches:
+            raw_v = m.group(1).strip()
+            v_name = _clean_sql_ident(raw_v)
+            line_num = text[: m.start()].count("\n") + 1
+            v_nid = _add_node(_make_id(stem, v_name), v_name, line_num)
+            for rm in re.finditer(rf"\b(?:FROM|JOIN)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
+                src_raw = rm.group(1).strip()
+                if src_raw.upper() not in ("OPENROWSET", "STRING_SPLIT", "SELECT", "VALUES"):
+                    src_tbl = _clean_sql_ident(src_raw)
+                    if src_tbl and src_tbl.lower() != v_name.lower() and not src_tbl.startswith("@"):
+                        src_nid = _ref_stub(src_tbl)
+                        _add_edge(v_nid, src_nid, "reads_from", line_num)
+
+    elif tbl_matches:
+        for m in tbl_matches:
+            raw_tbl = m.group(1).strip()
+            tbl_name = _clean_sql_ident(raw_tbl)
+            line_num = text[: m.start()].count("\n") + 1
+            tbl_nid = _add_node(_make_id(stem, tbl_name), tbl_name, line_num)
+
+            cols_body = m.group(2)
+            for col_line in cols_body.split(","):
+                col_m = re.search(r"^\s*(?:\[([^\]]+)\]|([a-zA-Z0-9_#$]+))\s+([a-zA-Z0-9_\(\)]+)", col_line.strip())
+                if col_m:
+                    col_name = col_m.group(1) or col_m.group(2)
+                    if col_name and col_name.upper() not in ("CONSTRAINT", "PRIMARY", "FOREIGN", "KEY", "INDEX", "UNIQUE", "CHECK"):
+                        col_nid = _add_node(_make_id(stem, tbl_name, col_name), f"{tbl_name}[{col_name}]", line_num)
+                        _add_edge(tbl_nid, col_nid, "contains", line_num)
+
+            # References / FK
+            for ref_m in re.finditer(rf"REFERENCES\s+{_IDENT_RE}", cols_body, re.IGNORECASE):
+                ref_tbl = _clean_sql_ident(ref_m.group(1).strip())
+                if ref_tbl:
+                    ref_nid = _ref_stub(ref_tbl)
+                    _add_edge(tbl_nid, ref_nid, "references", line_num)
+    else:
+        # Fallback table / procedure regex for script files
+        for fm in re.finditer(rf"\b(?:CREATE|ALTER)\s+(TABLE|VIEW|PROCEDURE|FUNCTION)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
+            kind = fm.group(1).upper()
+            raw_name = fm.group(2).strip()
+            obj_name = _clean_sql_ident(raw_name)
+            line_num = text[: fm.start()].count("\n") + 1
+            label = f"{obj_name}()" if kind in ("PROCEDURE", "FUNCTION") else obj_name
+            _add_node(_make_id(stem, obj_name), label, line_num)
+
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
-    """Extract tables, views, functions, and relationships from .sql files via tree-sitter."""
+    """Extract tables, views, functions, and relationships from .sql files."""
+    try:
+        if content is None:
+            raw_text = _read_sql_safe(path)
+        elif isinstance(content, bytes):
+            raw_text = content.decode("utf-8", errors="replace")
+        else:
+            raw_text = content
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
     try:
         import tree_sitter_sql as tssql
         from tree_sitter import Language, Parser
-    except ImportError as e:
-        import importlib.util
-        # An installed-but-broken grammar (e.g. a C extension built for a
-        # different Python ABI, #2602) raises ImportError here too. Reporting
-        # that as "not installed" sends the user to a no-op `pip install`, so
-        # distinguish a genuinely-absent module from one that failed to load
-        # and surface the real exception in the latter case.
-        if importlib.util.find_spec("tree_sitter_sql") is None:
-            return {"nodes": [], "edges": [],
-                    "error": "tree_sitter_sql not installed. Run: pip install tree-sitter-sql"}
-        return {"nodes": [], "edges": [],
-                "error": f"tree_sitter_sql is installed but failed to load: {e}"}
-
-    try:
         language = Language(tssql.language())
         parser = Parser(language)
-        source = (
-            content.encode("utf-8") if isinstance(content, str)
-            else content if content is not None
-            else path.read_bytes()
-        )
+        source = raw_text.encode("utf-8")
         tree = parser.parse(source)
         root = tree.root_node
-    except Exception as e:
-        return {"nodes": [], "edges": [], "error": str(e)}
+    except Exception:
+        # Graceful fallback to deterministic regex parser for T-SQL / Stored Procedures / DDL
+        return _extract_sql_deterministic(path, raw_text)
 
 
     stem = _file_stem(path)
@@ -111,7 +282,7 @@ def extract_sql(path: Path, content: str | bytes | None = None) -> dict:
             seen_ids.add(nid)
             nodes.append({"id": nid, "label": name, "file_type": "code",
                            "source_file": "", "source_location": "",
-                           "origin_file": str_path})
+                           "type": "namespace"})
         return nid
 
     def walk(node) -> None:

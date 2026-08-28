@@ -42,7 +42,7 @@ _MANIFEST_PATH = str(out_path("manifest.json"))
 _MTIME_COARSE_S = 2.0
 _MTIME_SUBSECOND_S = 0.05
 
-CODE_EXTENSIONS = {'.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.ejs', '.ets', '.go', '.rs', '.java', '.groovy', '.gradle', '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.cu', '.cuh', '.metal', '.rb', '.rake', '.swift', '.kt', '.kts', '.cs', '.scala', '.php', '.lua', '.luau', '.toc', '.zig', '.ps1', '.psm1', '.psd1', '.ex', '.exs', '.m', '.mm', '.ml', '.mli', '.jl', '.vue', '.svelte', '.astro', '.dart', '.v', '.sv', '.svh', '.sql', '.r', '.f', '.F', '.f90', '.F90', '.f95', '.F95', '.f03', '.F03', '.f08', '.F08', '.pas', '.pp', '.dpr', '.dpk', '.lpr', '.inc', '.dfm', '.lfm', '.lpk', '.sh', '.bash', '.json', '.tf', '.tfvars', '.hcl', '.dm', '.dme', '.dmi', '.dmm', '.dmf', '.sln', '.slnx', '.csproj', '.fsproj', '.vbproj', '.xaml', '.razor', '.cshtml', '.cls', '.trigger', '.lisp', '.cl', '.lsp', '.asd'}
+CODE_EXTENSIONS = {'.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.ejs', '.ets', '.go', '.rs', '.java', '.groovy', '.gradle', '.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.cu', '.cuh', '.metal', '.rb', '.rake', '.swift', '.kt', '.kts', '.cs', '.scala', '.php', '.lua', '.luau', '.toc', '.zig', '.ps1', '.psm1', '.psd1', '.ex', '.exs', '.m', '.mm', '.ml', '.mli', '.jl', '.vue', '.svelte', '.astro', '.dart', '.v', '.sv', '.svh', '.sql', '.r', '.f', '.F', '.f90', '.F90', '.f95', '.F95', '.f03', '.F03', '.f08', '.F08', '.pas', '.pp', '.dpr', '.dpk', '.lpr', '.inc', '.dfm', '.lfm', '.lpk', '.sh', '.bash', '.json', '.tf', '.tfvars', '.hcl', '.dm', '.dme', '.dmi', '.dmm', '.dmf', '.sln', '.slnx', '.csproj', '.fsproj', '.vbproj', '.xaml', '.razor', '.cshtml', '.cls', '.trigger', '.lisp', '.cl', '.lsp', '.asd', '.tmdl', '.tmld', '.pq', '.platform', '.pbir', '.pbism'}
 DOC_EXTENSIONS = {'.md', '.mdx', '.qmd', '.skill', '.txt', '.rst', '.html', '.yaml', '.yml'}
 PAPER_EXTENSIONS = {'.pdf'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}
@@ -508,6 +508,9 @@ def classify_file(path: Path) -> FileType | None:
     # and a package would split into duplicate file-anchored nodes (#1377).
     from graphify.manifest_ingest import is_package_manifest_path
     if is_package_manifest_path(path):
+        return FileType.CODE
+    # Fabric item platform configuration
+    if path.name.lower() == ".platform" or path.name.lower().endswith(".platform"):
         return FileType.CODE
     # Compound extensions must be checked before simple suffix lookup
     if path.name.lower().endswith(".blade.php"):
@@ -1623,10 +1626,17 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
 
     for scan_root in scan_paths:
         in_memory_tree = memory_dir.exists() and str(scan_root).startswith(str(memory_dir))
+        walk_root = _os_path(scan_root)
         for dirpath, dirnames, filenames in os.walk(
-            scan_root, followlinks=follow_symlinks, onerror=_on_walk_error
+            walk_root, followlinks=follow_symlinks, onerror=_on_walk_error
         ):
-            dp = Path(dirpath)
+            # Strip extended-length prefix if present so Path objects remain canonical
+            clean_dir = dirpath
+            if clean_dir.startswith("\\\\?\\UNC\\"):
+                clean_dir = "\\\\" + clean_dir[8:]
+            elif clean_dir.startswith("\\\\?\\"):
+                clean_dir = clean_dir[4:]
+            dp = Path(clean_dir)
             if follow_symlinks and os.path.islink(dirpath):
                 real = os.path.realpath(dirpath)
                 parent_real = os.path.realpath(os.path.dirname(dirpath))

@@ -479,7 +479,43 @@ def main() -> None:
             raise
 
 
+def _load_dotenv() -> None:
+    """Load environment variables from .env in cwd, repo root, or target path."""
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    # Check if a target directory was passed in CLI args
+    for arg in sys.argv[1:]:
+        if not arg.startswith("-"):
+            p = Path(arg)
+            if p.is_dir():
+                candidates.append(p / ".env")
+            break
+
+    for env_file in candidates:
+        if env_file.is_file():
+            try:
+                for line in env_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[7:].strip()
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+                        if len(v) >= 2 and ((v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'")):
+                            v = v[1:-1]
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+
 def _run_cli() -> None:
+    _load_dotenv()
     for _stream in (sys.stdout, sys.stderr):
         if _stream is not None and hasattr(_stream, "reconfigure"):
             try:

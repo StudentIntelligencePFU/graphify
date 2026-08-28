@@ -12,7 +12,81 @@ from collections import defaultdict
 from pathlib import Path
 
 from graphify._minhash import MinHash, MinHashLSH
-from rapidfuzz.distance import DamerauLevenshtein, Jaro, JaroWinkler
+
+try:
+    from rapidfuzz.distance import DamerauLevenshtein, Jaro, JaroWinkler
+except ImportError:
+    class DamerauLevenshtein:
+        @staticmethod
+        def distance(s1: str, s2: str) -> int:
+            d: dict[tuple[int, int], int] = {}
+            len1, len2 = len(s1), len(s2)
+            for i in range(-1, len1 + 1):
+                d[(i, -1)] = i + 1
+            for j in range(-1, len2 + 1):
+                d[(-1, j)] = j + 1
+            for i in range(len1):
+                for j in range(len2):
+                    cost = 0 if s1[i] == s2[j] else 1
+                    d[(i, j)] = min(
+                        d[(i - 1, j)] + 1,        # deletion
+                        d[(i, j - 1)] + 1,        # insertion
+                        d[(i - 1, j - 1)] + cost  # substitution
+                    )
+                    if i > 0 and j > 0 and s1[i] == s2[j - 1] and s1[i - 1] == s2[j]:
+                        d[(i, j)] = min(d[(i, j)], d[(i - 2, j - 2)] + 1)  # transposition
+            return d[(len1 - 1, len2 - 1)]
+
+    class Jaro:
+        @staticmethod
+        def normalized_similarity(s1: str, s2: str) -> float:
+            if s1 == s2:
+                return 1.0
+            len1, len2 = len(s1), len(s2)
+            if len1 == 0 or len2 == 0:
+                return 0.0
+            match_bound = max(len1, len2) // 2 - 1
+            if match_bound < 0:
+                match_bound = 0
+            matches1 = [False] * len1
+            matches2 = [False] * len2
+            matches = 0
+            for i in range(len1):
+                start = max(0, i - match_bound)
+                end = min(i + match_bound + 1, len2)
+                for j in range(start, end):
+                    if matches2[j]:
+                        continue
+                    if s1[i] == s2[j]:
+                        matches1[i] = True
+                        matches2[j] = True
+                        matches += 1
+                        break
+            if matches == 0:
+                return 0.0
+            k = transpositions = 0
+            for i in range(len1):
+                if not matches1[i]:
+                    continue
+                while not matches2[k]:
+                    k += 1
+                if s1[i] != s2[k]:
+                    transpositions += 1
+                k += 1
+            transpositions //= 2
+            return (matches / len1 + matches / len2 + (matches - transpositions) / matches) / 3.0
+
+    class JaroWinkler:
+        @staticmethod
+        def normalized_similarity(s1: str, s2: str, prefix_weight: float = 0.1) -> float:
+            jaro_sim = Jaro.normalized_similarity(s1, s2)
+            prefix_len = 0
+            for c1, c2 in zip(s1[:4], s2[:4]):
+                if c1 == c2:
+                    prefix_len += 1
+                else:
+                    break
+            return jaro_sim + prefix_len * prefix_weight * (1.0 - jaro_sim)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────

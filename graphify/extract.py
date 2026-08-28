@@ -43,6 +43,8 @@ from graphify.extractors.csharp import (
 from graphify.extractors.dart import extract_dart  # noqa: F401
 from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract_dmm  # noqa: F401
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
+from graphify.extractors.fabric_config import extract_fabric_config  # noqa: F401
+from graphify.extractors.pbir import extract_pbir  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
@@ -50,12 +52,14 @@ from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
 from graphify.extractors.markdown import extract_markdown, _MD_LINK_INDEX_CACHE  # noqa: F401
 from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form  # noqa: F401
+from graphify.extractors.powerquery import extract_powerquery  # noqa: F401
 from graphify.extractors.powershell import extract_powershell, extract_powershell_manifest  # noqa: F401
 from graphify.extractors.razor import extract_razor  # noqa: F401
 from graphify.extractors.rust import extract_rust  # noqa: F401
 from graphify.extractors.sln import extract_sln  # noqa: F401
 from graphify.extractors.sql import extract_sql  # noqa: F401
 from graphify.extractors.terraform import extract_terraform  # noqa: F401
+from graphify.extractors.tmdl import extract_tmdl  # noqa: F401
 from graphify.extractors.verilog import extract_verilog  # noqa: F401
 from graphify.extractors.zig import extract_zig  # noqa: F401
 from graphify.security import sanitize_metadata
@@ -2186,6 +2190,8 @@ _CASE_INSENSITIVE_EXTS = frozenset({
     ".php", ".phtml", ".php3", ".php4", ".php5", ".php7", ".phps",  # PHP fns/classes
     ".sql",                                                          # SQL identifiers
     ".nim", ".nims", ".nimble",                                      # Nim (style-insensitive)
+    ".tmdl", ".tmld",                                                # TMDL (case-insensitive tabular models)
+    ".pq",                                                           # Power Query M
 })
 
 
@@ -4269,13 +4275,11 @@ def extract_lazarus_package(path: Path) -> dict:
 
 
 def _check_tree_sitter_version() -> None:
-    """Raise a clear error if tree-sitter is too old for the new Language API."""
+    """Validate tree-sitter version when present. Individual tree-sitter extractors guard their own imports."""
     try:
         from tree_sitter import LANGUAGE_VERSION
     except ImportError:
-        raise ImportError(
-            "tree-sitter is not installed. Run: pip install 'tree-sitter>=0.23.0'"
-        )
+        return
     # Language API v2 starts at LANGUAGE_VERSION 14
     if LANGUAGE_VERSION < 14:
         import tree_sitter as _ts
@@ -5246,6 +5250,12 @@ _DISPATCH: dict[str, Any] = {
     ".cshtml": extract_razor,
     ".cls": extract_apex,
     ".trigger": extract_apex,
+    ".tmdl": extract_tmdl,
+    ".tmld": extract_tmdl,
+    ".pq": extract_powerquery,
+    ".platform": extract_fabric_config,
+    ".pbir": extract_fabric_config,
+    ".pbism": extract_fabric_config,
 }
 
 
@@ -5373,10 +5383,22 @@ def _is_cpp_header(path: Path) -> bool:
     return any(marker in head for marker in _CPP_HEADER_MARKERS)
 
 
+def _is_pbir_json(path: Path) -> bool:
+    """Whether a .json file is a Power BI Enhanced Report Format (PBIR) definition."""
+    return path.suffix == ".json" and any(p.name.endswith(".Report") for p in path.parents) and "definition" in path.parts
+
+
 def _get_extractor(path: Path) -> Any | None:
     """Return the correct extractor function for a file, or None if unsupported."""
     if path.name.lower().endswith(".blade.php"):
         return extract_blade
+    # PBIR report JSON files: route .json inside *.Report/definition/ to the
+    # PBIR extractor instead of the generic JSON extractor. This produces
+    # hierarchical Report -> Page -> Visual nodes with cross-links to the
+    # semantic model, replacing the generic key-value extraction that produced
+    # thousands of disconnected islands (#PBIR).
+    if _is_pbir_json(path):
+        return extract_pbir
     # MCP config files (.mcp.json, claude_desktop_config.json, ...) are routed
     # by filename before generic .json dispatch so they get MCP-aware nodes
     # (servers, commands, packages, env vars) instead of opaque JSON keys.
@@ -5387,6 +5409,8 @@ def _get_extractor(path: Path) -> Any | None:
     # (#1377). apm.yml would otherwise be a .yml document handled by the LLM.
     if is_package_manifest_path(path):
         return extract_package_manifest
+    if path.name.lower() == ".platform" or path.name.lower().endswith(".platform"):
+        return extract_fabric_config
     # `.h` is C/C++/ObjC-ambiguous; route Objective-C headers to extract_objc
     # (the suffix map sends `.h` to extract_c, which can't read @interface etc.).
     # ObjC sniffing has priority over the C++ sniff: an Objective-C++ header can
