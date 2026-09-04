@@ -373,3 +373,68 @@ def test_code_only_force_prunes_removed_semantic_files(tmp_path):
         "NOTES.txt was deleted from disk; its semantic nodes must be pruned "
         "(#2923 follow-up)"
     )
+
+
+def _two_cluster_repo(tmp_path: Path, big_group_extra: int = 0) -> Path:
+    """Repo with two disconnected call-cliques. `alpha` starts smaller than
+    `beta`; `big_group_extra` grows `alpha` so it can overtake `beta` in size
+    and flip the size-ranked community numbering."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def _clique(name: str, n: int) -> str:
+        names = [f"{name}_{i}" for i in range(n)]
+        lines = []
+        for i, fn in enumerate(names):
+            callee = names[(i + 1) % n]
+            lines.append(f"def {fn}():\n    return {callee}()\n")
+        return "\n".join(lines)
+
+    (repo / "alpha.py").write_text(_clique("alpha", 3 + big_group_extra))
+    (repo / "beta.py").write_text(_clique("beta", 6))
+    return repo
+
+
+def _community_by_label(graph_path: Path) -> dict[str, int]:
+    g = json.loads(graph_path.read_text())
+    return {
+        n["label"]: n["community"]
+        for n in g["nodes"]
+        if n.get("community") is not None
+    }
+
+
+def test_community_ids_stable_across_reclustering(tmp_path):
+    """A --force rebuild after a small change must NOT renumber the communities
+    of nodes that did not change. cluster() hands back size-ranked IDs, so
+    growing `alpha` past `beta` flips their raw numbering; the extract path must
+    remap to the previous graph.json (mirrors the cluster-only/#822 path) so a
+    knowledge-graph commit-back diffs only the real change, not ~90% of nodes."""
+    repo = _two_cluster_repo(tmp_path)
+    graph = repo / "graphify-out" / "graph.json"
+
+    r = _run(repo, "--code-only")
+    assert r.returncode == 0, r.stderr
+    before = _community_by_label(graph)
+    beta_cid_before = before["beta_0()"]
+    alpha_cid_before = before["alpha_0()"]
+    assert beta_cid_before != alpha_cid_before, "the two cliques must cluster apart"
+
+    # Grow alpha so it is now the larger clique — without the remap, size-ranking
+    # alone swaps alpha's and beta's community IDs.
+    (repo / "alpha.py").write_text(
+        "\n".join(
+            f"def alpha_{i}():\n    return alpha_{(i + 1) % 9}()\n" for i in range(9)
+        )
+    )
+    r = _run(repo, "--code-only", "--force")
+    assert r.returncode == 0, r.stderr
+    after = _community_by_label(graph)
+
+    assert after["beta_0()"] == beta_cid_before, (
+        f"beta's community id renumbered {beta_cid_before} -> {after['beta_0()']} "
+        "even though beta.py did not change"
+    )
+    assert after["alpha_0()"] == alpha_cid_before, (
+        f"alpha's community id renumbered {alpha_cid_before} -> {after['alpha_0()']}"
+    )

@@ -338,3 +338,54 @@ def test_update_prunes_a_removed_imports_edge(tmp_path):
              if e.get("relation") in ("imports", "imports_from")
              and str(e.get("source_file", "")).endswith("a.py")]
     assert not stale, f"removed import's edge survived update (stale): {stale}"
+
+
+def test_incremental_works_with_mtime_stripped_from_manifest(tmp_path):
+    """A manifest.json carrying only content hashes (no `mtime`/`seen`) must still
+    drive a correct incremental extract: unchanged files are recognised by hash
+    and NOT re-extracted, the changed file IS.
+
+    Contract for the graphify-refresh CI (student-intelligence-repo): a clean
+    runner rewrites every file's mtime on checkout, so `mtime`/`seen` in the
+    committed manifest churn ~10k diff lines every run for zero information. The
+    post-process strips them; detect_incremental must fall back to the MD5-vs-hash
+    path (detect.py:2315) rather than treating every file as new."""
+    proj = tmp_path / "proj"
+    pkg = proj / "pkg"
+    pkg.mkdir(parents=True)
+    (pkg / "b.py").write_text("def helper():\n    return 1\n")
+    (pkg / "a.py").write_text("from pkg.b import helper\ndef use():\n    return helper()\n")
+
+    first = _run(["extract", str(proj), "--code-only"], tmp_path)
+    assert first.returncode == 0, first.stderr
+    manifest = proj / "graphify-out" / "manifest.json"
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    assert data, "manifest should have entries"
+
+    # Strip the volatile fields, exactly like graphify_postprocess.py does.
+    stripped = {
+        path: {k: v for k, v in entry.items() if k not in ("mtime", "seen")}
+        if isinstance(entry, dict) else entry
+        for path, entry in data.items()
+    }
+    assert any("mtime" in e for e in data.values() if isinstance(e, dict)), (
+        "sanity: graphify should have written mtime in the first place"
+    )
+    manifest.write_text(json.dumps(stripped, indent=2), encoding="utf-8")
+
+    # Change ONLY a.py, then re-extract against the stripped manifest.
+    (pkg / "a.py").write_text(
+        "from pkg.b import helper\ndef use():\n    return helper()\n# touched\n"
+    )
+    second = _run(["extract", str(proj), "--code-only"], tmp_path)
+    assert second.returncode == 0, second.stderr
+    out = second.stdout.lower()
+    assert "incremental scan" in out, second.stdout
+    # b.py unchanged -> recognised by hash, not re-extracted; a.py -> re-extracted.
+    assert "1 re-extracted" in out, second.stdout
+    assert "cached/unchanged" in out and "0 files cached/unchanged" not in out, second.stdout
+
+    gj = proj / "graphify-out" / "graph.json"
+    after = json.loads(gj.read_text(encoding="utf-8"))
+    labels = {n["label"] for n in after["nodes"]}
+    assert any("helper" in l for l in labels) and any("use" in l for l in labels), labels

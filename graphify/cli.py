@@ -4160,6 +4160,37 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
 
         communities = _cluster(G, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
+        # Align community IDs with the previous graph.json by node-overlap. cluster()
+        # hands back size-ranked integer IDs (0 = largest), so ANY real change to the
+        # graph permutes those IDs across the whole graph — which rewrites the
+        # `community` field on most nodes and, because to_json sorts the node array
+        # by each node's serialized form, reorders the array too. The grouping is
+        # essentially reproducible; only the numbering churns. Remapping to the prior
+        # assignment keeps IDs (and the .graphify_labels.json that keys on them)
+        # attached to the same conceptual community run-to-run. Mirrors the
+        # cluster-only / watch / update path (#822); this `extract` path was the one
+        # place that clustered without it. Applies to --force rebuilds too (the
+        # weekly recluster is exactly when the churn is worst). Fail-open: a bad
+        # read just means one run renumbers, not a crash.
+        if existing_graph_path.exists():
+            try:
+                from graphify.cluster import remap_communities_to_previous as _remap
+                from graphify.security import check_graph_file_size_cap as _cap_check
+                _cap_check(existing_graph_path)
+                _prev_raw = json.loads(existing_graph_path.read_text(encoding="utf-8"))
+                _prev_node_community = {
+                    n["id"]: n["community"]
+                    for n in _prev_raw.get("nodes", [])
+                    if n.get("community") is not None and n.get("id") is not None
+                }
+                if _prev_node_community:
+                    communities = _remap(communities, _prev_node_community)
+            except Exception as _remap_exc:
+                print(
+                    f"[graphify extract] warning: could not align community IDs with "
+                    f"the previous graph ({_remap_exc}); IDs may renumber this run",
+                    file=sys.stderr,
+                )
         stages.mark("cluster")
         cohesion = _score_all(G, communities)
         try:
