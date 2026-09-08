@@ -120,14 +120,23 @@ in
 
 [DataDestinations = {[Definition = [QueryName = "VentasConsolidadas"]]} ]
 """
-    pq_file = tmp_path / "mashup.pq"
+    df_dir = tmp_path / "DF_Ventas.Dataflow"
+    df_dir.mkdir()
+    pq_file = df_dir / "mashup.pq"
     pq_file.write_text(pq_content, encoding="utf-8")
 
     res = extract_powerquery(pq_file)
     labels = {n["label"] for n in res["nodes"]}
 
-    assert "Clientes" in labels
-    assert "VentasConsolidadas" in labels
+    # Query labels are qualified by the owning Fabric item: the bare M identifier
+    # is not unique across the dozens of dataflows a single repo holds.
+    assert "DF_Ventas[Clientes]" in labels
+    assert "DF_Ventas[VentasConsolidadas]" in labels
+
+    # Tables are schema-qualified so they land on the same node the SQL
+    # extractor mints for the same table, instead of a bare-name ghost.
+    assert "dbo.Dim_Clientes" in labels
+    assert "stg.VentasRaw" in labels
 
     edges = res["edges"]
     # Check SQL & Warehouse source edges
@@ -150,3 +159,150 @@ def test_fabric_config_extraction(tmp_path: Path):
     res_pbir = extract_fabric_config(pbir_file)
     assert any("SalesModel" in n["label"] for n in res_pbir["nodes"])
     assert any(e["relation"] == "references" for e in res_pbir["edges"])
+
+
+def test_powerquery_quoted_query_names_with_spaces(tmp_path: Path):
+    """`shared #"Name With Spaces"` must be extracted, not silently dropped.
+
+    The bare-token name pattern this replaced dropped ~16% of the declarations in
+    a real Fabric repo and, because the query-body lookahead keyed on the same
+    pattern, folded each dropped body into the preceding query's.
+    """
+    pq_content = (
+        'section Section1;\n\n'
+        'shared #"PFU v_lead_pfuonline" = let\n'
+        '    Source = Sql.Database("srv", "DB", [Query = "SELECT * FROM [stg].[atn_lead_Raw]"])\n'
+        'in\n    Source;\n\n'
+        'shared Otra = let\n'
+        '    Source = Sql.Database("srv", "DB", [Query = "SELECT * FROM [ods].[Otra_Base]"])\n'
+        'in\n    Source;\n'
+    )
+    df_dir = tmp_path / "SI_ATENEA_2.Dataflow"
+    df_dir.mkdir()
+    (df_dir / "mashup.pq").write_text(pq_content, encoding="utf-8")
+
+    res = extract_powerquery(df_dir / "mashup.pq")
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    labels = set(by_id.values())
+    assert "SI_ATENEA_2[PFU v_lead_pfuonline]" in labels
+    assert "SI_ATENEA_2[Otra]" in labels
+
+    # Each query keeps its own body: the spaced-name query must not have been
+    # absorbed into a neighbour, which is how the old pattern failed.
+    reads = {
+        (by_id.get(e["source"]), by_id.get(e["target"]))
+        for e in res["edges"]
+        if e["relation"] == "reads_from"
+    }
+    assert ("SI_ATENEA_2[PFU v_lead_pfuonline]", "stg.atn_lead_Raw") in reads
+    assert ("SI_ATENEA_2[Otra]", "ods.Otra_Base") in reads
+
+
+def test_powerquery_datadestination_binds_to_its_own_table(tmp_path: Path):
+    """Each [DataDestinations] block resolves to ITS OWN destination table.
+
+    The previous implementation searched the whole file for the first
+    `Item = "..."` and reused it for every destination, so a file with three
+    destinations emitted the same target three times — two of them false.
+    """
+    pq_content = (
+        'section Section1;\n\n'
+        '[DataDestinations = {[Definition = [Kind = "Reference", QueryName = "A_DataDestination"], '
+        'Settings = [Kind = "Manual"]]}]\n'
+        'shared A = let Source = Sql.Database("srv", "DB", '
+        '[Query = "SELECT 1 FROM [stg].[Src_A]"]) in Source;\n\n'
+        '[DataDestinations = {[Definition = [Kind = "Reference", QueryName = "B_DataDestination"], '
+        'Settings = [Kind = "Manual"]]}]\n'
+        'shared B = let Source = Sql.Database("srv", "DB", '
+        '[Query = "SELECT 1 FROM [stg].[Src_B]"]) in Source;\n\n'
+        'shared A_DataDestination = let\n'
+        '    Pattern = Fabric.Warehouse([HierarchicalNavigation = null]),\n'
+        '    Nav = Pattern{[warehouseId = "wh-1"]}[Data],\n'
+        '    T = Nav{[Schema = "ods", Item = "Tabla_A"]}[Data]\n'
+        'in\n    T;\n\n'
+        'shared B_DataDestination = let\n'
+        '    Pattern = Fabric.Warehouse([HierarchicalNavigation = true]),\n'
+        '    Nav = Pattern{[displayName = "SI_SQLandia"]}[Data],\n'
+        '    Sch = Nav{[Schema = "ods"]}[Data],\n'
+        '    T = Sch{[Name = "Tabla_B_Distinta"]}[Data]\n'
+        'in\n    T;\n'
+    )
+    df_dir = tmp_path / "SI_ODS_X.Dataflow"
+    df_dir.mkdir()
+    (df_dir / "mashup.pq").write_text(pq_content, encoding="utf-8")
+
+    res = extract_powerquery(df_dir / "mashup.pq")
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    writes = {
+        (by_id.get(e["source"]), by_id.get(e["target"]))
+        for e in res["edges"]
+        if e["relation"] == "writes_to"
+    }
+    # Distinct targets, and the hierarchical (Schema then Name) form resolves to
+    # a table whose name differs from the query that feeds it.
+    assert ("SI_ODS_X[A]", "ods.Tabla_A") in writes
+    assert ("SI_ODS_X[B]", "ods.Tabla_B_Distinta") in writes
+    assert len(writes) == 2
+
+
+def test_powerquery_native_sql_tables(tmp_path: Path):
+    """Tables named only inside `[Query = "..."]` native SQL are still lineage."""
+    pq_content = (
+        'section Section1;\n\n'
+        'shared Q = let\n'
+        '    Source = Sql.Database("srv", "DB", [Query = "#(lf)WITH ctc AS (#(lf)'
+        'SELECT * FROM [stg].[atn_contact_Raw]#(lf))#(lf)'
+        'SELECT * FROM ctc JOIN ods.Calendario c ON 1=1"])\n'
+        'in\n    Source;\n'
+    )
+    df_dir = tmp_path / "DF_N.Dataflow"
+    df_dir.mkdir()
+    (df_dir / "mashup.pq").write_text(pq_content, encoding="utf-8")
+
+    res = extract_powerquery(df_dir / "mashup.pq")
+    labels = {n["label"] for n in res["nodes"]}
+    assert "stg.atn_contact_Raw" in labels
+    assert "ods.Calendario" in labels
+    # `ctc` is a CTE, not a table: unqualified names must not become nodes.
+    assert "ctc" not in labels
+
+
+def test_fabric_config_links_dataflow_to_its_mashup(tmp_path: Path):
+    """A .platform item must link to the sibling file holding its definition.
+
+    Without this edge the item node is a degree-1 orphan and the Mashup lineage
+    extracted from the sibling mashup.pq sits in a disconnected island —
+    `neighbors("Dataflow: X")` returned nothing at all.
+    """
+    df_dir = tmp_path / "DF_Ventas.Dataflow"
+    df_dir.mkdir()
+    (df_dir / "mashup.pq").write_text("section Section1;\n", encoding="utf-8")
+    platform_file = df_dir / ".platform"
+    platform_file.write_text(
+        '{"metadata": {"type": "Dataflow", "displayName": "DF_Ventas"}}', encoding="utf-8"
+    )
+
+    res = extract_fabric_config(platform_file)
+    targets = {e["target"] for e in res["edges"] if e.get("context") == "item_definition"}
+    assert targets, "no item_definition edge emitted"
+
+    mashup_nid = next(
+        n["id"] for n in extract_powerquery(df_dir / "mashup.pq")["nodes"]
+        if n["label"] == "mashup.pq"
+    )
+    # The id the .platform extractor points at must be exactly the one the
+    # powerquery extractor mints for the same file, or the edge dangles: both
+    # must be the same key going into extract()'s file-id remap.
+    assert mashup_nid in targets
+
+
+def test_fabric_config_no_definition_edge_when_file_absent(tmp_path: Path):
+    """No sibling mashup.pq on disk -> no dangling edge to a node nobody mints."""
+    df_dir = tmp_path / "DF_Vacio.Dataflow"
+    df_dir.mkdir()
+    platform_file = df_dir / ".platform"
+    platform_file.write_text(
+        '{"metadata": {"type": "Dataflow", "displayName": "DF_Vacio"}}', encoding="utf-8"
+    )
+    res = extract_fabric_config(platform_file)
+    assert not [e for e in res["edges"] if e.get("context") == "item_definition"]

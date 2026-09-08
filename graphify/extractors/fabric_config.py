@@ -15,6 +15,20 @@ from typing import Any
 
 from graphify.extractors.base import _file_stem, _make_id
 
+# Definition files that carry an item's actual logic, keyed by the `type` in
+# .platform metadata. The .platform file only holds metadata, so without these
+# edges the item node is a degree-1 orphan and its logic sits in a disconnected
+# island — `neighbors("Dataflow: X")` returned nothing even though the sibling
+# mashup.pq was fully extracted (#dataflow-island).
+#
+# Only files an extractor actually mints a node for belong here, or the edge
+# dangles: a Dataflow's queryMetadata.json is deliberately absent because
+# extract_json returns no nodes for it (it is column metadata, not logic).
+_ITEM_DEFINITION_FILES: dict[str, tuple[str, ...]] = {
+    "Dataflow": ("mashup.pq",),
+    "Notebook": ("notebook-content.py",),
+}
+
 
 def _read_text_safe(path: Path) -> str:
     """Read text handling Windows extended-length long paths (>260 chars)."""
@@ -126,6 +140,22 @@ def extract_fabric_config(path: Path, content: str | bytes | None = None) -> dic
         if description:
             # Also attach description context to edge
             edges[0]["context"] = f"description={description}"
+
+        # Link the item to the sibling files holding its definition. The target id
+        # is minted as _make_id(str(<path>)) — byte-for-byte what the owning
+        # extractor (powerquery for mashup.pq) mints for its own file node — so
+        # both endpoints go through the same key in extract()'s file-id remap and
+        # land on the canonical repo-relative id together. Deriving it any other
+        # way (e.g. via _file_stem) yields a different key and the edge dangles.
+        for def_name in _ITEM_DEFINITION_FILES.get(item_type, ()):
+            def_path = path.parent / def_name
+            try:
+                if not def_path.exists():
+                    continue
+            except OSError:
+                continue
+            _add_edge(item_nid, _make_id(str(def_path)), "contains", 1,
+                      context="item_definition")
 
         return {"nodes": nodes, "edges": edges}
 
