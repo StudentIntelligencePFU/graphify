@@ -995,6 +995,85 @@ def test_to_html_handles_null_source_file_and_label(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
+def test_to_html_patterns_panel_present_in_full_detail_view(tmp_path):
+    """The Patterns panel (preset node selections) and the subgroup jump-to
+    dropdown ship by default in a true per-node render (member_counts unset)."""
+    G = make_graph()
+    communities = cluster(G)
+    labels = {cid: f"Group {cid}" for cid in communities}
+    out = tmp_path / "graph.html"
+    to_html(G, communities, str(out), community_labels=labels)
+    content = out.read_text()
+    assert '<div id="patterns-wrap">' in content
+    assert '<select id="subgroup-select">' in content
+    # All five presets, by their data-pattern key.
+    for key in ("hubs", "isolated", "bridges", "stubs", "largest"):
+        assert f'data-pattern="{key}"' in content
+    assert "window.applyPattern" in content
+    assert "window.__clearActivePattern" in content
+
+
+def test_to_html_patterns_panel_absent_in_aggregated_view(tmp_path):
+    """In the aggregated community-meta-graph view (member_counts set) each
+    rendered node IS a whole community — hub/isolated/bridge/stub have no
+    sensible per-meta-node meaning there (every meta-node has an empty
+    source_file by construction, which would make "stubs" wrongly select all
+    of them), so the panel must be skipped entirely rather than shipping a
+    misleading control."""
+    G = make_graph()
+    communities = cluster(G)
+    member_counts = {cid: len(members) for cid, members in communities.items()}
+    out = tmp_path / "graph.html"
+    to_html(G, communities, str(out), member_counts=member_counts)
+    content = out.read_text()
+    assert '<div id="patterns-wrap">' not in content
+    assert '<select id="subgroup-select">' not in content
+    assert "window.applyPattern" not in content
+
+
+def test_to_html_patterns_reads_unprefixed_raw_node_fields(tmp_path):
+    """Regression guard: RAW_NODES entries carry `community`/`source_file`/
+    `degree` with NO leading underscore — the underscore-prefixed names
+    (`_community`, `_source_file`, `_degree`) exist ONLY on the separate
+    nodesDS-mapped objects `_html_script` builds for the click-to-inspect
+    panel. The patterns script must read RAW_NODES's own field names, or every
+    computed pattern silently degenerates (e.g. `!n._source_file` is `true`
+    for every node, since the field is simply undefined there — "Unresolved
+    references" would wrongly select the entire graph)."""
+    G = make_graph()
+    communities = cluster(G)
+    out = tmp_path / "graph.html"
+    to_html(G, communities, str(out), community_labels={cid: f"G{cid}" for cid in communities})
+    content = out.read_text()
+    i = content.index("const byId = new Map")
+    j = content.index("const PATTERNS = {", i)
+    patterns_src = content[i:j]
+    for bad in ("n._degree", "n._community", "n._source_file", "nb._community"):
+        assert bad not in patterns_src, f"found stale prefixed field read: {bad}"
+    for good in ("n.degree", "n.community", "n.source_file", "nb.community"):
+        assert good in patterns_src, f"missing expected unprefixed field read: {good}"
+
+
+def test_to_html_patterns_output_survives_non_utf8_read(tmp_path):
+    """Regression guard: the panel's icons must be HTML numeric character
+    references (&#x1F525; etc.), not raw multi-byte emoji. write_text_atomic's
+    contract is UTF-8, but a caller that reads the output without pinning that
+    encoding — e.g. Path.read_text() on Windows, which falls back to the
+    system codepage — must not crash. This exact class of bug broke every
+    to_html test on Windows the first time the panel shipped with raw emoji."""
+    G = make_graph()
+    communities = cluster(G)
+    out = tmp_path / "graph.html"
+    to_html(G, communities, str(out), community_labels={cid: f"G{cid}" for cid in communities})
+    raw = out.read_bytes()
+    # Must not raise UnicodeDecodeError — this is exactly what Path.read_text()
+    # does internally on a machine whose default codepage is cp1252.
+    raw.decode("cp1252")
+    content = out.read_text(encoding="utf-8")
+    assert "&#x1F525;" in content  # hubs icon, as a numeric reference
+    assert "\U0001F525" not in content  # never as a raw literal emoji
+
+
 def test_existing_graph_node_count(tmp_path):
     from graphify.export import existing_graph_node_count, MALFORMED_GRAPH
     p = tmp_path / "graph.json"

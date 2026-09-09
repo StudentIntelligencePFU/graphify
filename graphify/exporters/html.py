@@ -67,6 +67,16 @@ def _html_styles() -> str:
   .legend-cb:checked::after, #select-all-cb:checked::after { content: ''; position: absolute; left: 3.5px; top: 1px; width: 4px; height: 7px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
   #select-all-cb:indeterminate { background: #4E79A7; border-color: #4E79A7; }
   #select-all-cb:indeterminate::after { content: ''; position: absolute; left: 2px; top: 5px; width: 8px; height: 2px; background: #fff; border: none; transform: none; }
+  #patterns-wrap { padding: 12px; border-bottom: 1px solid #2a2a4e; }
+  #patterns-wrap h3 { font-size: 13px; color: #aaa; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .pattern-btn { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: #0f0f1a; border: 1px solid #3a3a5e; color: #ccc; padding: 7px 10px; border-radius: 6px; font-size: 12.5px; cursor: pointer; margin-bottom: 6px; transition: background .15s, border-color .15s; }
+  .pattern-btn:hover { background: #2a2a4e; border-color: #4E79A7; }
+  .pattern-btn.active { background: #24314f; border-color: #4E79A7; color: #fff; }
+  .pattern-btn .pb-icon { flex-shrink: 0; }
+  .pattern-btn .pb-count { margin-left: auto; color: #666; font-size: 11px; }
+  #pattern-reset { background: transparent; border-style: dashed; color: #888; }
+  #subgroup-select { width: 100%; background: #0f0f1a; border: 1px solid #3a3a5e; color: #e0e0e0; padding: 6px 8px; border-radius: 6px; font-size: 12.5px; outline: none; margin-bottom: 10px; }
+  #subgroup-select:focus { border-color: #4E79A7; }
 </style>"""
 
 def _hyperedge_script(hyperedges_json: str) -> str:
@@ -350,6 +360,162 @@ LEGEND.forEach(c => {{
 </script>"""
 
 
+def _patterns_script() -> str:
+    """Two <script> blocks: preset node-selection patterns, and a searchable
+    dropdown to jump straight to one community ("subgroup") by name.
+
+    Both operate purely on RAW_NODES/RAW_EDGES/LEGEND/nodesDS/network —
+    already declared as top-level const/function in the SAME html document by
+    _html_script — and reuse RAW_NODES's own field names as-is (community,
+    source_file, degree; no leading underscore — that prefix only exists on
+    the SEPARATE nodesDS-mapped objects `_html_script` builds for the
+    click-to-inspect panel).
+
+    All five patterns are graph-generic (hub/isolated/bridge/stub/
+    largest-community): none assume anything about what the code being
+    graphed is — this exporter serves any language, any repo.
+
+    Only meaningful for a true per-node render: skipped by the caller when
+    ``member_counts`` is set (the aggregated community-meta-graph view, where
+    each rendered "node" already IS a whole community — "isolated"/"stub"
+    have no sensible per-meta-node meaning there, and every meta-node has an
+    empty source_file by construction, which would make "stubs" wrongly
+    select all of them — the same class of bug a from-undefined-field
+    mismatch caused here during manual testing before this landed).
+    """
+    return """<script>
+(function() {
+  const byId = new Map(RAW_NODES.map(n => [n.id, n]));
+  const neighborsOf = new Map();
+  RAW_EDGES.forEach(e => {
+    if (!neighborsOf.has(e.from)) neighborsOf.set(e.from, []);
+    if (!neighborsOf.has(e.to)) neighborsOf.set(e.to, []);
+    neighborsOf.get(e.from).push(e.to);
+    neighborsOf.get(e.to).push(e.from);
+  });
+
+  function computeHubs() {
+    const N = 40;
+    return new Set(RAW_NODES.slice().sort((a, b) => b.degree - a.degree).slice(0, N).map(n => n.id));
+  }
+  function computeIsolated() {
+    return new Set(RAW_NODES.filter(n => n.degree <= 1).map(n => n.id));
+  }
+  function computeBridges() {
+    const out = new Set();
+    RAW_NODES.forEach(n => {
+      const nbs = neighborsOf.get(n.id) || [];
+      const foreignComms = new Set();
+      nbs.forEach(nid => {
+        const nb = byId.get(nid);
+        if (nb && nb.community !== n.community) foreignComms.add(nb.community);
+      });
+      if (foreignComms.size >= 2) out.add(n.id);
+    });
+    return out;
+  }
+  function computeStubs() {
+    return new Set(RAW_NODES.filter(n => !n.source_file).map(n => n.id));
+  }
+  function computeLargestCommunity() {
+    if (!LEGEND.length) return new Set();
+    const top = LEGEND.reduce((a, b) => (b.count > a.count ? b : a));
+    return new Set(RAW_NODES.filter(n => n.community === top.cid).map(n => n.id));
+  }
+
+  const PATTERNS = {
+    hubs: computeHubs,
+    isolated: computeIsolated,
+    bridges: computeBridges,
+    stubs: computeStubs,
+    largest: computeLargestCommunity,
+  };
+
+  document.querySelectorAll('.pattern-btn[data-pattern]').forEach(btn => {
+    const key = btn.dataset.pattern;
+    btn.querySelector('.pb-count').textContent = PATTERNS[key]().size;
+  });
+
+  let activeBtn = null;
+
+  function applyPattern(idSet, btn) {
+    const updates = RAW_NODES.map(n => ({ id: n.id, hidden: !idSet.has(n.id) }));
+    nodesDS.update(updates);
+    document.querySelectorAll('.pattern-btn').forEach(b => b.classList.remove('active'));
+    if (btn) btn.classList.add('active');
+    activeBtn = btn || null;
+    // The community legend follows the pattern's result: a community shows
+    // as visible when at least one of its nodes stayed visible.
+    const visibleComms = new Set();
+    RAW_NODES.forEach(n => { if (idSet.has(n.id)) visibleComms.add(n.community); });
+    // legend-item carries no cid in the DOM: walked in the same order
+    // _html_script built the legend from LEGEND.
+    LEGEND.forEach((c, i) => {
+      const item = legendEl.children[i];
+      if (!item) return;
+      const cb = item.querySelector('.legend-cb');
+      const visible = visibleComms.has(c.cid);
+      cb.checked = visible;
+      item.classList.toggle('dimmed', !visible);
+      if (visible) hiddenCommunities.delete(c.cid); else hiddenCommunities.add(c.cid);
+    });
+    updateSelectAllState();
+    network.fit({ nodes: Array.from(idSet), animation: { duration: 400, easingFunction: 'easeInOutQuad' } });
+  }
+
+  document.querySelectorAll('.pattern-btn[data-pattern]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (activeBtn === btn) { toggleAllCommunities(false); network.fit(); activeBtn = null; btn.classList.remove('active'); return; }
+      applyPattern(PATTERNS[btn.dataset.pattern](), btn);
+    });
+  });
+
+  document.getElementById('pattern-reset').addEventListener('click', () => {
+    toggleAllCommunities(false);
+    document.querySelectorAll('.pattern-btn').forEach(b => b.classList.remove('active'));
+    activeBtn = null;
+    network.fit();
+  });
+
+  // Exposed for the subgroup-select script below: let/const inside this
+  // IIFE do NOT cross to another <script> tag (unlike _html_script's
+  // top-level const), so window is the only way through.
+  window.applyPattern = applyPattern;
+  window.__clearActivePattern = function() {
+    document.querySelectorAll('.pattern-btn').forEach(b => b.classList.remove('active'));
+    activeBtn = null;
+  };
+})();
+</script>
+<script>
+(function() {
+  const sel = document.getElementById('subgroup-select');
+  // LEGEND already carries {cid, color, label, count} per community, computed
+  // in Python — alphabetical by label so the browser's native jump-to-letter
+  // search on a focused <select> works as a name search.
+  const options = LEGEND.slice().sort((a, b) => a.label.localeCompare(b.label));
+  options.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = String(c.cid);
+    opt.textContent = `${c.label} (${c.count})`;
+    sel.appendChild(opt);
+  });
+
+  sel.addEventListener('change', () => {
+    window.__clearActivePattern();
+    if (!sel.value) { toggleAllCommunities(false); network.fit(); return; }
+    const cid = Number(sel.value);
+    const idSet = new Set(RAW_NODES.filter(n => n.community === cid).map(n => n.id));
+    window.applyPattern(idSet, null);
+  });
+
+  document.querySelectorAll('.pattern-btn').forEach(btn => {
+    btn.addEventListener('click', () => { sel.value = ''; });
+  });
+})();
+</script>"""
+
+
 def _html_document_title(output_path: str) -> str:
     """Return a portable label for the graph.html <title>.
 
@@ -598,6 +764,41 @@ def to_html(
     title = _html.escape(sanitize_label(_html_document_title(output_path)))
     stats = f"{G.number_of_nodes()} nodes &middot; {G.number_of_edges()} edges &middot; {len(communities)} communities"
 
+    # Patterns panel + subgroup jump-to-community dropdown: only in the true
+    # per-node render. In the aggregated community-meta-graph view (member_counts
+    # set) each rendered "node" IS a whole community — hub/isolated/bridge/stub
+    # do not carry the same meaning there (every meta-node has an empty
+    # source_file by construction, which would make "stubs" wrongly select all
+    # of them), so the whole panel is skipped rather than shipping a
+    # misleading control. See _patterns_script's docstring.
+    if member_counts:
+        patterns_panel_html = ""
+        subgroup_select_html = ""
+        patterns_script_html = ""
+    else:
+        # Icons are HTML numeric character references, not raw emoji bytes:
+        # to_html's contract is UTF-8 (write_text_atomic), but a consumer that
+        # reads the output without pinning that encoding (e.g. Path.read_text()
+        # on Windows, which falls back to the system codepage) chokes on raw
+        # multi-byte UTF-8. Numeric refs keep the generated file pure ASCII —
+        # the browser still renders the emoji — regardless of what the reader
+        # assumes.
+        patterns_panel_html = """  <div id="patterns-wrap">
+    <h3>Patterns</h3>
+    <button class="pattern-btn" data-pattern="hubs"><span class="pb-icon">&#x1F525;</span> Most connected <span class="pb-count"></span></button>
+    <button class="pattern-btn" data-pattern="isolated"><span class="pb-icon">&#x1F3DD;&#xFE0F;</span> Isolated (degree &le; 1) <span class="pb-count"></span></button>
+    <button class="pattern-btn" data-pattern="bridges"><span class="pb-icon">&#x1F309;</span> Bridges between communities <span class="pb-count"></span></button>
+    <button class="pattern-btn" data-pattern="stubs"><span class="pb-icon">&#x2753;</span> Unresolved references <span class="pb-count"></span></button>
+    <button class="pattern-btn" data-pattern="largest"><span class="pb-icon">&#x1F310;</span> Largest community <span class="pb-count"></span></button>
+    <button class="pattern-btn" id="pattern-reset">&#x21BA; Show all</button>
+  </div>
+"""
+        subgroup_select_html = """    <select id="subgroup-select">
+      <option value="">&mdash; Jump to a subgroup &mdash;</option>
+    </select>
+"""
+        patterns_script_html = _patterns_script()
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -619,17 +820,18 @@ def to_html(
     <h3>Node Info</h3>
     <div id="info-content"><span class="empty">Click a node to inspect it</span></div>
   </div>
-  <div id="legend-wrap">
+{patterns_panel_html}  <div id="legend-wrap">
     <h3>Communities</h3>
     <div id="legend-controls">
       <label><input type="checkbox" id="select-all-cb" checked onchange="toggleAllCommunities(!this.checked)">Select All</label>
     </div>
-    <div id="legend"></div>
+{subgroup_select_html}    <div id="legend"></div>
   </div>
   <div id="stats">{stats}</div>
 </div>
 {_html_script(nodes_json, edges_json, legend_json)}
 {_hyperedge_script(hyperedges_json)}
+{patterns_script_html}
 </body>
 </html>"""
 
