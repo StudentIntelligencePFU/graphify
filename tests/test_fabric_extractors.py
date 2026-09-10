@@ -26,6 +26,8 @@ def test_fabric_extractors_registry_and_facade():
 
 def test_tmdl_table_columns_measures_extraction(tmp_path: Path):
     """Verify TMDL table, columns, calculated columns, DAX measures and M partitions are extracted."""
+    model_dir = tmp_path / "SalesModel.SemanticModel" / "definition" / "tables"
+    model_dir.mkdir(parents=True)
     tmdl_content = """table 'Ventas'
 \tlineageTag: a1b2c3d4-0000
 
@@ -47,33 +49,89 @@ def test_tmdl_table_columns_measures_extraction(tmp_path: Path):
 
 \tpartition 'Ventas' = m
 \t\tmode: import
-\t\tsource = ```
+\t\tsource =
 \t\t\tlet
-\t\t\t    Source = Sql.Database("sqlserver.db.windows.net", "SalesDB", [Query="SELECT * FROM [dbo].[Ventas]"])
+\t\t\t    Source = Sql.Database("sqlserver.db.windows.net", "SalesDB", [Query="SELECT * FROM [dbo].[Ventas Fact]"])
 \t\t\tin
 \t\t\t    Source
-\t\t\t```
 """
-    tmdl_file = tmp_path / "Ventas.tmdl"
+    tmdl_file = model_dir / "Ventas.tmdl"
     tmdl_file.write_text(tmdl_content, encoding="utf-8")
 
     res = extract_tmdl(tmdl_file)
-    nodes = {n["id"]: n for n in res["nodes"]}
     labels = {n["label"] for n in res["nodes"]}
 
-    # Table and columns
+    # Table and columns — entity nodes carry NO file-stem prefix so they reconcile
+    # with the same names as referenced from a PBIR visual.
     assert "Ventas" in labels
     assert "Ventas[ID_Venta]" in labels
     assert "Ventas[Monto]" in labels
     assert "Ventas[MontoConIVA]" in labels
-    assert "[Total Ventas]" in labels
-    assert "[Total Con Descuento]" in labels
+    # Measures are table-qualified (a visual references them as 'Ventas'[Total Ventas]).
+    assert "Ventas[Total Ventas]" in labels
+    assert "Ventas[Total Con Descuento]" in labels
 
-    # Measure dependencies
     edges = res["edges"]
-    # [Total Con Descuento] -> [Total Ventas]
-    reads_from = [(e["source"], e["target"]) for e in edges if e["relation"] == "reads_from"]
-    assert any("Total Ventas" in str(tgt) or "total_ventas" in str(tgt) for src, tgt in reads_from)
+    lbl = {n["id"]: n["label"] for n in res["nodes"]}
+    reads_from = {(lbl.get(e["source"], e["source"]), lbl.get(e["target"], e["target"]))
+                  for e in edges if e["relation"] == "reads_from"}
+
+    # measure -> measure dependency
+    assert ("Ventas[Total Con Descuento]", "Ventas[Total Ventas]") in reads_from
+    # the SemanticModel node is minted and owns the table
+    assert "SemanticModel: SalesModel" in labels
+    assert any(lbl.get(e["source"]) == "SemanticModel: SalesModel"
+               and lbl.get(e["target"]) == "Ventas"
+               and e["relation"] == "contains" for e in edges)
+    # partition M lineage -> warehouse table, bracketed name with a space survives
+    assert ("Ventas", "dbo.Ventas Fact") in reads_from
+
+
+def test_tmdl_partition_navigation_source(tmp_path: Path):
+    """A record-navigation M partition (no [Query=]) still yields warehouse lineage."""
+    tdir = tmp_path / "M.SemanticModel" / "definition" / "tables"
+    tdir.mkdir(parents=True)
+    (tdir / "Dim.tmdl").write_text(
+        "table Dim\n"
+        "\tcolumn A\n\t\tdataType: string\n"
+        "\tpartition Dim = m\n"
+        "\t\tmode: import\n"
+        "\t\tsource =\n"
+        "\t\t\tlet\n"
+        '\t\t\t    Origen = Sql.Database("srv", "WH"),\n'
+        '\t\t\t    d = Origen{[Schema="dm", Item="(Dim)_Cosa"]}[Data]\n'
+        "\t\t\tin\n\t\t\t    d\n",
+        encoding="utf-8",
+    )
+    res = extract_tmdl(tdir / "Dim.tmdl")
+    lbl = {n["id"]: n["label"] for n in res["nodes"]}
+    reads_from = {(lbl.get(e["source"]), lbl.get(e["target"]))
+                  for e in res["edges"] if e["relation"] == "reads_from"}
+    assert ("Dim", "dm.(Dim)_Cosa") in reads_from
+
+
+def test_tmdl_model_file_lists_tables(tmp_path: Path):
+    """model.tmdl `ref table` lines become SemanticModel -> contains -> Table."""
+    mdir = tmp_path / "Foo.SemanticModel" / "definition"
+    mdir.mkdir(parents=True)
+    (mdir / "model.tmdl").write_text(
+        "model Model\n\tculture: es-ES\n\n"
+        "ref table Ventas\n"
+        "ref table Clientes\n"
+        "ref table LocalDateTable_abc\n",
+        encoding="utf-8",
+    )
+    res = extract_tmdl(mdir / "model.tmdl")
+    lbl = {n["id"]: n["label"] for n in res["nodes"]}
+    contains = {(lbl.get(e["source"]), lbl.get(e["target"]))
+               for e in res["edges"] if e["relation"] == "contains"}
+    assert ("SemanticModel: Foo", "Ventas") in contains
+    assert ("SemanticModel: Foo", "Clientes") in contains
+    # auto date tables are noise, never linked
+    assert not any(t == "LocalDateTable_abc" for _, t in contains)
+    # the model node is source-backed (owned), not a bare stub
+    model_node = next(n for n in res["nodes"] if n["label"] == "SemanticModel: Foo")
+    assert model_node["source_file"]
 
 
 def test_tmdl_relationships_extraction(tmp_path: Path):

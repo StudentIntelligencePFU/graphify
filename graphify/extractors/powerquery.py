@@ -41,8 +41,12 @@ _NATIVE_SQL_RE = re.compile(
 )
 # schema-qualified table in T-SQL, bracketed or not. The schema qualifier is
 # required: it is what keeps CTE and alias names (always unqualified) out.
+# A bracketed identifier may hold anything but ``]`` — Fabric DM tables are named
+# ``[dm].[(Dim)_VOC_UCMA_Asignaturas]`` etc., which a bare ``\w+`` alternative
+# silently drops.
 _SQL_TABLE_RE = re.compile(
-    r"\b(?:FROM|JOIN|INTO|UPDATE)\s+\[?(\w+)\]?\s*\.\s*\[?(\w+)\]?",
+    r"\b(?:FROM|JOIN|INTO|UPDATE)\s+"
+    r"(?:\[([^\]]+)\]|(\w+))\s*\.\s*(?:\[([^\]]+)\]|(\w+))",
     re.IGNORECASE,
 )
 # M escape sequences that appear inside embedded SQL.
@@ -131,7 +135,7 @@ def _native_sql_tables(body: str) -> list[tuple[str, str]]:
         for old, new in _M_ESCAPES:
             sql = sql.replace(old, new)
         for tm in _SQL_TABLE_RE.finditer(sql):
-            pair = (tm.group(1), tm.group(2))
+            pair = (tm.group(1) or tm.group(2), tm.group(3) or tm.group(4))
             if pair not in seen:
                 seen.add(pair)
                 pairs.append(pair)
