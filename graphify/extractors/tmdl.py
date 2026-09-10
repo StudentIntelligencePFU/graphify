@@ -3,10 +3,11 @@
 Extracts semantic models, tables, columns, DAX measures with dependency analysis,
 model relationships and M partition source lineage.
 
-Node identity is deliberately BARE (``_make_id(label)``, no file-stem prefix) for
-every model entity — SemanticModel, Table, ``Table[Column]``, ``Table[Measure]`` —
-so the nodes this extractor mints from ``*.SemanticModel/definition/`` land on the
-SAME node id that:
+Every model entity — SemanticModel, Table, ``Table[Column]``, ``Table[Measure]`` —
+is a sourceless ``type: namespace`` stub keyed on the bare ``_make_id(label)``,
+the same shape the PBIR and Power Query extractors use. That is what lets the
+node this extractor defines from ``*.SemanticModel/definition/`` land on the SAME
+id that:
 
   * the PBIR extractor mints from a visual's ``Entity[prop]`` reference and from a
     report's ``targets_semantic_model`` edge, and
@@ -14,9 +15,18 @@ SAME node id that:
 
 Without that, the semantic-model layer is an island: ``neighbors(SemanticModel)``
 returns nothing and the chain warehouse -> model -> report -> page -> visual is
-broken at the model boundary. The cost is that two same-named tables in different
-models collapse to one node (rare: three ``Table1`` across throwaway profiling
-models); reconciliation is worth it.
+broken at the model boundary.
+
+Why sourceless rather than source-backed: a bare id is not the ``<path>_<entity>``
+form graphify's dedup treats as a "definer", so a source-backed node here loses
+the collision to its own reference stub and is dropped with a warning (every
+accented filename, every ``model.tmdl``). Provenance instead rides the ``contains``
+edge (file + line) and the file node one hop away — the shape the warehouse layer
+already uses (a namespace stub for lineage plus a separate SQL-owned node).
+
+The cost is that two same-named tables in different models collapse to one node
+(rare: three ``Table1`` across throwaway profiling models); reconciliation is
+worth it.
 """
 from __future__ import annotations
 
@@ -155,31 +165,12 @@ def extract_tmdl(path: Path, content: str | bytes | None = None) -> dict[str, An
     edges: list[dict[str, Any]] = []
     seen_ids: set[str] = {file_nid}
 
-    def _add_node(nid: str, label: str, line: int, *, contained_by: str | None = None) -> str:
-        """Owned node: source-backed, linked from its container (file node by default)."""
-        if nid not in seen_ids:
-            seen_ids.add(nid)
-            nodes.append({
-                "id": nid,
-                "label": label,
-                "file_type": "code",
-                "source_file": str_path,
-                "source_location": f"L{line}",
-            })
-            edges.append({
-                "source": contained_by if contained_by else file_nid,
-                "target": nid,
-                "relation": "contains",
-                "confidence": "EXTRACTED",
-                "source_file": str_path,
-                "source_location": f"L{line}",
-                "weight": 1.0,
-            })
-        return nid
+    _edge_seen: set[tuple[str, str, str]] = set()
 
     def _add_edge(src: str, tgt: str, relation: str, line: int, context: str | None = None) -> None:
-        if not src or not tgt or src == tgt:
+        if not src or not tgt or src == tgt or (src, tgt, relation) in _edge_seen:
             return
+        _edge_seen.add((src, tgt, relation))
         edge: dict[str, Any] = {
             "source": src,
             "target": tgt,
@@ -194,11 +185,20 @@ def extract_tmdl(path: Path, content: str | bytes | None = None) -> dict[str, An
         edges.append(edge)
 
     def _ref_stub(name: str) -> str:
-        """Sourceless global node that merges by label across every file.
+        """Sourceless ``type: namespace`` node that merges by label across every file.
 
-        Same shape as the PBIR and Power Query extractors' stubs (``type:
-        namespace``) so a table, measure or warehouse object this extractor
-        references lands on the exact node they mint for the same name.
+        Same shape as the PBIR and Power Query extractors' stubs, so a
+        SemanticModel / Table / ``Table[Column]`` / ``Table[Measure]`` / warehouse
+        object this file names lands on the exact node they mint for that name.
+
+        Model entities are NOT minted source-backed on purpose: a bare
+        ``_make_id(label)`` id is not the ``<path>_<entity>`` form graphify's
+        dedup expects of a definer, so an owned node here loses the collision to
+        the reference stub and gets dropped with a warning (accented filenames,
+        every ``model.tmdl``). Provenance instead rides the ``contains`` edge
+        (this file + line) and the file node one hop away — the same shape the
+        warehouse layer already uses (a namespace stub for lineage + a separate
+        SQL-owned node).
         """
         nid = _make_id(name)
         if nid not in seen_ids:
@@ -213,8 +213,26 @@ def extract_tmdl(path: Path, content: str | bytes | None = None) -> dict[str, An
             })
         return nid
 
-    # SemanticModel node — bare id so it reconciles with PBIR's targets_semantic_model
-    # target. Minted as a stub here; model.tmdl upgrades it to an owned node.
+    def _entity(name: str, line: int, container: str | None) -> str:
+        """A model entity stub plus a ``contains`` edge from its container."""
+        nid = _ref_stub(name)
+        if container:
+            _add_edge(container, nid, "contains", line)
+        return nid
+
+    def _local_node(nid: str, label: str, line: int) -> str:
+        """File-local owned node (Expression / QueryGroup / Culture) — never
+        referenced from another file, so a path-derived id is safe here."""
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({
+                "id": nid, "label": label, "file_type": "code",
+                "source_file": str_path, "source_location": f"L{line}",
+            })
+            _add_edge(file_nid, nid, "contains", line)
+        return nid
+
+    # SemanticModel node — bare id so it reconciles with PBIR's targets_semantic_model.
     model_nid = _ref_stub(f"SemanticModel: {model_name}") if model_name else None
 
     filename = path.name.lower()
@@ -263,30 +281,21 @@ def extract_tmdl(path: Path, content: str | bytes | None = None) -> dict[str, An
     # 2. model.tmdl / database.tmdl  ->  SemanticModel + contains Table
     # ─────────────────────────────────────────────────────────────────────────
     if filename in ("model.tmdl", "database.tmdl") or text.lstrip().startswith(("model ", "database ")):
-        owned_model_nid = None
-        if model_name and filename == "model.tmdl":
-            # Upgrade the SemanticModel stub to an owned, source-backed node.
-            owned_model_nid = _make_id(f"SemanticModel: {model_name}")
-            if owned_model_nid in seen_ids:
-                seen_ids.discard(owned_model_nid)
-                nodes[:] = [n for n in nodes if n["id"] != owned_model_nid]
-            _add_node(owned_model_nid, f"SemanticModel: {model_name}", 1)
-
-        container = owned_model_nid or model_nid
+        container = model_nid or file_nid
         for idx, line in enumerate(lines, start=1):
             s = line.strip()
             if s.startswith("queryGroup "):
                 qg = _strip_quotes(s.replace("queryGroup", "", 1))
                 if qg:
-                    _add_node(_make_id(stem, "queryGroup", qg), f"QueryGroup: {qg}", idx)
+                    _local_node(_make_id(stem, "queryGroup", qg), f"QueryGroup: {qg}", idx)
             elif s.startswith("ref table "):
                 tbl = _strip_quotes(s.replace("ref table", "", 1))
                 if tbl and not tbl.startswith(("LocalDateTable_", "DateTableTemplate_")):
-                    _add_edge(container or file_nid, _ref_stub(tbl), "contains", idx)
+                    _add_edge(container, _ref_stub(tbl), "contains", idx)
             elif s.startswith("ref cultureInfo "):
                 cult = _strip_quotes(s.replace("ref cultureInfo", "", 1))
                 if cult:
-                    _add_node(_make_id(stem, "culture", cult), f"Culture: {cult}", idx)
+                    _local_node(_make_id(stem, "culture", cult), f"Culture: {cult}", idx)
         return {"nodes": nodes, "edges": edges}
 
     # Auto-generated date tables carry no business meaning — skip entirely.
@@ -357,16 +366,14 @@ def extract_tmdl(path: Path, content: str | bytes | None = None) -> dict[str, An
             _flush_measure()
             _flush_m_source()
             current_table_name = _strip_quotes(stripped.replace("table", "", 1))
-            current_table_nid = _add_node(_make_id(current_table_name), current_table_name, idx)
-            if model_nid:
-                _add_edge(model_nid, current_table_nid, "contains", idx)
+            current_table_nid = _entity(current_table_name, idx, model_nid)
             continue
 
         if stripped.startswith("expression "):
             _flush_measure()
             _flush_m_source()
             expr_name = _strip_quotes(stripped.replace("expression", "", 1).split("=", 1)[0])
-            expr_nid = _add_node(_make_id(stem, "expression", expr_name), f"Expression: {expr_name}", idx)
+            expr_nid = _local_node(_make_id(stem, "expression", expr_name), f"Expression: {expr_name}", idx)
             in_m_source = True
             m_source_lines = []
             m_owner_nid = expr_nid
@@ -381,15 +388,13 @@ def extract_tmdl(path: Path, content: str | bytes | None = None) -> dict[str, An
             if "=" in col_part and "dataType:" not in col_part.split("=", 1)[0]:
                 col_name_raw, dax_part = col_part.split("=", 1)
                 col_name = _strip_quotes(col_name_raw)
-                col_nid = _add_node(_make_id(f"{tbl}[{col_name}]"), f"{tbl}[{col_name}]", idx,
-                                    contained_by=current_table_nid)
+                col_nid = _entity(f"{tbl}[{col_name}]", idx, current_table_nid)
                 col_refs, _ = _extract_dax_references(dax_part)
                 for t_ref, c_ref in col_refs:
                     _add_edge(col_nid, _ref_stub(f"{t_ref}[{c_ref}]"), "reads_from", idx)
             else:
                 col_name = _strip_quotes(col_part.split("dataType:")[0].split("=")[0])
-                _add_node(_make_id(f"{tbl}[{col_name}]"), f"{tbl}[{col_name}]", idx,
-                          contained_by=current_table_nid)
+                _entity(f"{tbl}[{col_name}]", idx, current_table_nid)
             continue
 
         if stripped.startswith("measure "):
@@ -399,12 +404,7 @@ def extract_tmdl(path: Path, content: str | bytes | None = None) -> dict[str, An
             current_measure_name = _strip_quotes(parts[0])
             current_measure_line = idx
             tbl = current_table_name or ""
-            current_measure_nid = _add_node(
-                _make_id(f"{tbl}[{current_measure_name}]"),
-                f"{tbl}[{current_measure_name}]",
-                idx,
-                contained_by=current_table_nid,
-            )
+            current_measure_nid = _entity(f"{tbl}[{current_measure_name}]", idx, current_table_nid)
             current_measure_expr = [parts[1].strip()] if len(parts) > 1 else []
             continue
 

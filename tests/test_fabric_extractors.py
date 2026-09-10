@@ -129,9 +129,14 @@ def test_tmdl_model_file_lists_tables(tmp_path: Path):
     assert ("SemanticModel: Foo", "Clientes") in contains
     # auto date tables are noise, never linked
     assert not any(t == "LocalDateTable_abc" for _, t in contains)
-    # the model node is source-backed (owned), not a bare stub
+    # model / table / measure nodes are sourceless `namespace` stubs so they
+    # reconcile with PBIR by label; provenance rides the contains edge + file node.
     model_node = next(n for n in res["nodes"] if n["label"] == "SemanticModel: Foo")
-    assert model_node["source_file"]
+    assert model_node.get("type") == "namespace"
+    assert not model_node["source_file"]
+    contains_edge = next(e for e in res["edges"]
+                         if e["relation"] == "contains" and lbl.get(e["target"]) == "Ventas")
+    assert contains_edge["source_file"].endswith("model.tmdl")
 
 
 def test_tmdl_relationships_extraction(tmp_path: Path):
