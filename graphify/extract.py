@@ -45,6 +45,7 @@ from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.fabric_config import extract_fabric_config  # noqa: F401
 from graphify.extractors.pbir import extract_pbir  # noqa: F401
+from graphify.extractors.powerautomate import extract_powerautomate  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
@@ -5388,6 +5389,20 @@ def _is_pbir_json(path: Path) -> bool:
     return path.suffix == ".json" and any(p.name.endswith(".Report") for p in path.parents) and "definition" in path.parts
 
 
+def _is_power_automate_json(path: Path) -> bool:
+    """Whether a .json file is part of a Power Automate flow pulled into the repo.
+
+    Every `.json` under a `power-automate/` directory (metadata.json,
+    definition.json, connections.json, the environment's `_connections.json`,
+    the repo's `_env_map.json`) must route here, not just `metadata.json` —
+    the extractor is the one that decides which of those siblings mint nodes.
+    Leaving any of them to the generic JSON extractor reproduces the Dataflow
+    island bug: a `definition.json` can be 250KB+ of nested WDL, and the
+    generic extractor would turn every key into its own disconnected node.
+    """
+    return path.suffix == ".json" and any(p.lower() == "power-automate" for p in path.parts)
+
+
 def _get_extractor(path: Path) -> Any | None:
     """Return the correct extractor function for a file, or None if unsupported."""
     if path.name.lower().endswith(".blade.php"):
@@ -5399,6 +5414,10 @@ def _get_extractor(path: Path) -> Any | None:
     # thousands of disconnected islands (#PBIR).
     if _is_pbir_json(path):
         return extract_pbir
+    # Power Automate flow JSON: same rationale as PBIR above, see
+    # _is_power_automate_json.
+    if _is_power_automate_json(path):
+        return extract_powerautomate
     # MCP config files (.mcp.json, claude_desktop_config.json, ...) are routed
     # by filename before generic .json dispatch so they get MCP-aware nodes
     # (servers, commands, packages, env vars) instead of opaque JSON keys.

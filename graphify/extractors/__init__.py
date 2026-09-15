@@ -27,6 +27,7 @@ from graphify.extractors.objc import extract_objc
 from graphify.extractors.pascal import extract_pascal
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form
 from graphify.extractors.pbir import extract_pbir
+from graphify.extractors.powerautomate import extract_powerautomate
 from graphify.extractors.powerquery import extract_powerquery
 from graphify.extractors.powershell import extract_powershell, extract_powershell_manifest
 from graphify.extractors.razor import extract_razor
@@ -60,6 +61,7 @@ LANGUAGE_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     "objc": extract_objc,
     "pascal": extract_pascal,
     "pbir": extract_pbir,
+    "powerautomate": extract_powerautomate,
     "powerquery": extract_powerquery,
     "powershell": extract_powershell,
     "powershell_manifest": extract_powershell_manifest,
