@@ -5,6 +5,7 @@ import re
 
 from pathlib import Path
 from graphify.extractors.base import _file_stem, _make_id
+from graphify.extractors.repo_config import default_catalog_for
 
 
 def _norm_ident(name: str) -> str:
@@ -42,8 +43,20 @@ def _read_sql_safe(path: Path) -> str:
         return f.read()
 
 
-def _clean_sql_ident(ident: str) -> str:
-    """Strip brackets/quotes and return clean identifier."""
+def _clean_sql_ident(ident: str, default_catalog: str | None = None) -> str:
+    """Strip brackets/quotes and return clean identifier.
+
+    If `default_catalog` is given and the result has 3+ dot-parts whose first
+    part matches it case-insensitively, that leading part is dropped — so
+    `Catalog.schema.table` canonicalizes to the `schema.table` form other
+    extractors (which never see the catalog name — e.g. Power Query's Fabric
+    navigation records) already mint for the same object. Without this a
+    3-part T-SQL reference and its 2-part dataflow counterpart mint two
+    different node ids for one physical table and the lineage silently
+    splits in two. See `graphify.extractors.repo_config`. `default_catalog`
+    is None unless a repo opts in via `.graphifyconfig.json`, so this is a
+    no-op for every repo that hasn't.
+    """
     raw = ident.strip()
     parts = []
     for p in raw.split("."):
@@ -55,12 +68,15 @@ def _clean_sql_ident(ident: str) -> str:
         elif p.startswith("`") and p.endswith("`"):
             p = p[1:-1]
         parts.append(p.strip())
+    if default_catalog and len(parts) >= 3 and parts[0].lower() == default_catalog.lower():
+        parts = parts[1:]
     return ".".join(parts)
 
 
 def _extract_sql_deterministic(path: Path, text: str) -> dict:
     """Extract DDL tables, views, stored procedures and data lineage using regex."""
     stem = _file_stem(path)
+    default_catalog = default_catalog_for(path)
     str_path = str(path)
     file_nid = _make_id(str_path)
     nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
@@ -125,7 +141,7 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
     if sp_matches:
         for m in sp_matches:
             raw_sp = m.group(1).strip()
-            sp_name = _clean_sql_ident(raw_sp)
+            sp_name = _clean_sql_ident(raw_sp, default_catalog)
             line_num = text[: m.start()].count("\n") + 1
             sp_nid = _add_node(_make_id(stem, sp_name), f"{sp_name}()", line_num)
 
@@ -133,7 +149,7 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
             for wm in re.finditer(rf"\b(?:INSERT\s+INTO|TRUNCATE\s+TABLE|UPDATE|MERGE\s+INTO)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
                 target_raw = wm.group(1).strip()
                 if target_raw.upper() not in ("TOP", "OUTPUT", "SET", "DEFAULT"):
-                    target_tbl = _clean_sql_ident(target_raw)
+                    target_tbl = _clean_sql_ident(target_raw, default_catalog)
                     if target_tbl and target_tbl.lower() != sp_name.lower() and not target_tbl.startswith("@"):
                         tgt_nid = _ref_stub(target_tbl)
                         _add_edge(sp_nid, tgt_nid, "writes_to", line_num)
@@ -142,7 +158,7 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
             for rm in re.finditer(rf"\b(?:FROM|JOIN)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
                 src_raw = rm.group(1).strip()
                 if src_raw.upper() not in ("OPENROWSET", "STRING_SPLIT", "SELECT", "VALUES"):
-                    src_tbl = _clean_sql_ident(src_raw)
+                    src_tbl = _clean_sql_ident(src_raw, default_catalog)
                     if src_tbl and src_tbl.lower() != sp_name.lower() and not src_tbl.startswith("@"):
                         src_nid = _ref_stub(src_tbl)
                         _add_edge(sp_nid, src_nid, "reads_from", line_num)
@@ -151,7 +167,7 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
             for em in re.finditer(rf"\b(?:EXEC|EXECUTE)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
                 call_raw = em.group(1).strip()
                 if call_raw.upper() not in ("SP_EXECUTESQL",):
-                    call_sp = _clean_sql_ident(call_raw)
+                    call_sp = _clean_sql_ident(call_raw, default_catalog)
                     if call_sp and call_sp.lower() != sp_name.lower() and not call_sp.startswith("@"):
                         call_nid = _ref_stub(f"{call_sp}()")
                         _add_edge(sp_nid, call_nid, "calls", line_num)
@@ -159,13 +175,13 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
     elif view_matches:
         for m in view_matches:
             raw_v = m.group(1).strip()
-            v_name = _clean_sql_ident(raw_v)
+            v_name = _clean_sql_ident(raw_v, default_catalog)
             line_num = text[: m.start()].count("\n") + 1
             v_nid = _add_node(_make_id(stem, v_name), v_name, line_num)
             for rm in re.finditer(rf"\b(?:FROM|JOIN)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
                 src_raw = rm.group(1).strip()
                 if src_raw.upper() not in ("OPENROWSET", "STRING_SPLIT", "SELECT", "VALUES"):
-                    src_tbl = _clean_sql_ident(src_raw)
+                    src_tbl = _clean_sql_ident(src_raw, default_catalog)
                     if src_tbl and src_tbl.lower() != v_name.lower() and not src_tbl.startswith("@"):
                         src_nid = _ref_stub(src_tbl)
                         _add_edge(v_nid, src_nid, "reads_from", line_num)
@@ -173,7 +189,7 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
     elif tbl_matches:
         for m in tbl_matches:
             raw_tbl = m.group(1).strip()
-            tbl_name = _clean_sql_ident(raw_tbl)
+            tbl_name = _clean_sql_ident(raw_tbl, default_catalog)
             line_num = text[: m.start()].count("\n") + 1
             tbl_nid = _add_node(_make_id(stem, tbl_name), tbl_name, line_num)
 
@@ -188,7 +204,7 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
 
             # References / FK
             for ref_m in re.finditer(rf"REFERENCES\s+{_IDENT_RE}", cols_body, re.IGNORECASE):
-                ref_tbl = _clean_sql_ident(ref_m.group(1).strip())
+                ref_tbl = _clean_sql_ident(ref_m.group(1).strip(), default_catalog)
                 if ref_tbl:
                     ref_nid = _ref_stub(ref_tbl)
                     _add_edge(tbl_nid, ref_nid, "references", line_num)
@@ -197,7 +213,7 @@ def _extract_sql_deterministic(path: Path, text: str) -> dict:
         for fm in re.finditer(rf"\b(?:CREATE|ALTER)\s+(TABLE|VIEW|PROCEDURE|FUNCTION)\s+{_IDENT_RE}", clean_text, re.IGNORECASE):
             kind = fm.group(1).upper()
             raw_name = fm.group(2).strip()
-            obj_name = _clean_sql_ident(raw_name)
+            obj_name = _clean_sql_ident(raw_name, default_catalog)
             line_num = text[: fm.start()].count("\n") + 1
             label = f"{obj_name}()" if kind in ("PROCEDURE", "FUNCTION") else obj_name
             _add_node(_make_id(stem, obj_name), label, line_num)
