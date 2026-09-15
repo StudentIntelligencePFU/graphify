@@ -47,8 +47,9 @@ def _html_styles() -> str:
   #info-content .field { margin-bottom: 5px; }
   #info-content .field b { color: #e0e0e0; }
   #info-content .empty { color: #555; font-style: italic; }
-  .neighbor-link { display: block; padding: 2px 6px; margin: 2px 0; border-radius: 3px; cursor: pointer; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-left: 3px solid #333; }
+  .neighbor-link { display: block; padding: 2px 6px; margin: 2px 0; border-radius: 3px; cursor: pointer; border-left: 3px solid #333; }
   .neighbor-link:hover { background: #2a2a4e; }
+  .neighbor-link > div { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #neighbors-list { max-height: 160px; overflow-y: auto; margin-top: 4px; }
   #legend-wrap { flex: 1; overflow-y: auto; padding: 12px; }
   #legend-wrap h3 { font-size: 13px; color: #aaa; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -173,6 +174,7 @@ const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({{
   width: e.width,
   color: e.color,
   arrows: {{ to: {{ enabled: true, scaleFactor: 0.5 }} }},
+  _relation: e.label, _context: e.context || '',
 }})));
 
 const container = document.getElementById('graph');
@@ -208,11 +210,24 @@ network.once('stabilizationIterationsDone', () => {{
 function showInfo(nodeId) {{
   const n = nodesDS.get(nodeId);
   if (!n) return;
-  const neighborIds = network.getConnectedNodes(nodeId);
-  const neighborItems = neighborIds.map(nid => {{
+  // Walk edges (not getConnectedNodes) so each hop carries WHY it exists —
+  // the relation and, when the extractor recorded one, the context (a SQL
+  // action name, an m_partition, a DAX expression). That is what turns
+  // "51 nodes away from a Visual" into an actually-followable lineage trail
+  // (e.g. a PowerAutomate flow's shared_sql read fusing into the same table
+  // stub a semantic model partition reads, on into a report visual).
+  const edgeIds = network.getConnectedEdges(nodeId);
+  const neighborItems = edgeIds.map(eid => {{
+    const e = edgesDS.get(eid);
+    if (!e) return '';
+    const nid = e.from === nodeId ? e.to : e.from;
+    const dir = e.from === nodeId ? '->' : '<-';
     const nb = nodesDS.get(nid);
     const color = nb ? nb.color.background : '#555';
-    return `<span class="neighbor-link" style="border-left-color:${{esc(color)}}" data-nid="${{esc(nid)}}">${{esc(nb ? nb.label : nid)}}</span>`;
+    const relLine = esc(dir) + ' ' + esc(e._relation || '') + (e._context ? ` - ${{esc(e._context)}}` : '');
+    return `<span class="neighbor-link" style="border-left-color:${{esc(color)}}" data-nid="${{esc(nid)}}">` +
+           `<div>${{esc(nb ? nb.label : nid)}}</div>` +
+           `<div style="font-size:11px;color:#888">${{relLine}}</div></span>`;
   }}).join('');
   document.getElementById('info-content').innerHTML = `
     <div class="field"><b>${{esc(n.label)}}</b></div>
@@ -220,7 +235,7 @@ function showInfo(nodeId) {{
     <div class="field">Community: ${{esc(n._community_name)}}</div>
     <div class="field">Source: ${{esc(n._source_file || '-')}}</div>
     <div class="field">Degree: ${{n._degree}}</div>
-    ${{neighborIds.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{neighborIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>` : ''}}
+    ${{edgeIds.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{edgeIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>` : ''}}
   `;
 }}
 
@@ -734,11 +749,21 @@ def to_html(
         relation = data.get("relation", "")
         true_src = data.get("_src", u)
         true_tgt = data.get("_tgt", v)
+        # `context` carries the specific WHY behind an edge (e.g. "shared_sql
+        # action=General_Profile_SQL", an m_partition name) — without it, every
+        # `reads_from` line looks the same and tracing a lineage path (a
+        # PowerAutomate flow's SQL read fusing with a semantic model's table,
+        # on into a report visual) means opening each source file by hand.
+        context = sanitize_label(str(data.get("context") or ""))
+        title = f"{relation} [{confidence}]"
+        if context:
+            title += f"\n{context}"
         vis_edges.append({
             "from": true_src,
             "to": true_tgt,
             "label": relation,
-            "title": _html.escape(f"{relation} [{confidence}]"),
+            "context": context,
+            "title": _html.escape(title),
             "dashes": confidence != "EXTRACTED",
             "width": 2 if confidence == "EXTRACTED" else 1,
             "color": {"opacity": 0.7 if confidence == "EXTRACTED" else 0.35},
