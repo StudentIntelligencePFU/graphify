@@ -78,6 +78,21 @@ def _html_styles() -> str:
   #pattern-reset { background: transparent; border-style: dashed; color: #888; }
   #subgroup-select { width: 100%; background: #0f0f1a; border: 1px solid #3a3a5e; color: #e0e0e0; padding: 6px 8px; border-radius: 6px; font-size: 12.5px; outline: none; margin-bottom: 10px; }
   #subgroup-select:focus { border-color: #4E79A7; }
+  .lineage-trigger { display: block; width: 100%; margin-top: 10px; background: #24314f; border: 1px solid #4E79A7; color: #fff; padding: 7px 10px; border-radius: 6px; font-size: 12.5px; cursor: pointer; }
+  .lineage-trigger:hover { background: #2d3d63; }
+  #lineage-wrap { display: none; flex: 1; flex-direction: column; overflow-y: auto; padding: 12px; border-top: 1px solid #2a2a4e; }
+  #lineage-wrap h3 { font-size: 13px; color: #aaa; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  #lineage-wrap h3 span { color: #e0e0e0; text-transform: none; letter-spacing: normal; }
+  #lineage-exit-btn { display: block; width: 100%; margin-bottom: 10px; background: transparent; border: 1px dashed #888; color: #ccc; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  #lineage-exit-btn:hover { border-color: #4E79A7; color: #fff; }
+  .lineage-hop { display: flex; align-items: center; gap: 6px; padding: 4px 6px; margin: 2px 0; border-left: 3px solid #333; border-radius: 3px; cursor: pointer; }
+  .lineage-hop:hover { background: #2a2a4e; }
+  .lineage-hop-marker { flex-shrink: 0; color: #888; font-size: 10px; }
+  .lineage-hop-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+  .lineage-hop-dist { flex-shrink: 0; color: #666; font-size: 10px; }
+  #lineage-edges-title { margin-top: 10px; color: #aaa; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .lineage-edge { padding: 4px 6px; margin: 2px 0; font-size: 11.5px; color: #bbb; border-radius: 3px; line-height: 1.5; }
+  .lineage-edge.filter { background: rgba(245, 158, 11, 0.12); border-left: 3px solid #f59e0b; color: #ffd699; }
 </style>"""
 
 def _hyperedge_script(hyperedges_json: str) -> str:
@@ -177,21 +192,27 @@ const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({{
   _relation: e.label, _context: e.context || '',
 }})));
 
+// Shared with the lineage view (_lineage_script), which switches the network
+// to a hierarchical layout with physics off while tracing a chain and must
+// restore EXACTLY this config on exit — a second, drifted copy of these
+// numbers would silently diverge from the graph's normal resting layout.
+const DEFAULT_PHYSICS = {{
+  enabled: true,
+  solver: 'forceAtlas2Based',
+  forceAtlas2Based: {{
+    gravitationalConstant: -60,
+    centralGravity: 0.005,
+    springLength: 120,
+    springConstant: 0.08,
+    damping: 0.4,
+    avoidOverlap: 0.8,
+  }},
+  stabilization: {{ iterations: 200, fit: true }},
+}};
+
 const container = document.getElementById('graph');
 const network = new vis.Network(container, {{ nodes: nodesDS, edges: edgesDS }}, {{
-  physics: {{
-    enabled: true,
-    solver: 'forceAtlas2Based',
-    forceAtlas2Based: {{
-      gravitationalConstant: -60,
-      centralGravity: 0.005,
-      springLength: 120,
-      springConstant: 0.08,
-      damping: 0.4,
-      avoidOverlap: 0.8,
-    }},
-    stabilization: {{ iterations: 200, fit: true }},
-  }},
+  physics: DEFAULT_PHYSICS,
   interaction: {{
     hover: true,
     tooltipDelay: 100,
@@ -235,6 +256,7 @@ function showInfo(nodeId) {{
     <div class="field">Community: ${{esc(n._community_name)}}</div>
     <div class="field">Source: ${{esc(n._source_file || '-')}}</div>
     <div class="field">Degree: ${{n._degree}}</div>
+    ${{edgeIds.length ? `<button class="lineage-trigger" data-nid="${{esc(nodeId)}}">&#128279; Trace lineage</button>` : ''}}
     ${{edgeIds.length ? `<div class="field" style="margin-top:8px;color:#aaa;font-size:11px">Neighbors (${{edgeIds.length}})</div><div id="neighbors-list">${{neighborItems}}</div>` : ''}}
   `;
 }}
@@ -526,6 +548,208 @@ def _patterns_script() -> str:
 
   document.querySelectorAll('.pattern-btn').forEach(btn => {
     btn.addEventListener('click', () => { sel.value = ''; });
+  });
+})();
+</script>"""
+
+
+def _lineage_script() -> str:
+    """Trace-lineage panel: from a selected node, follow directed edges both
+    forward (downstream — where the data goes) and backward (upstream — where
+    it came from) and render just that chain, instead of the whole graph.
+
+    Two things make a full-graph render useless for answering "where does this
+    data come from / end up, and what filters it along the way": (1) it is
+    still every OTHER node and edge in the corpus, competing for attention and
+    physics-simulation time, and (2) `reads_from`/`writes_to`/`contains`/
+    `displays_measure`-style edges already encode direction ("arrows follow
+    the sense of the data", per the exporter's own edge-direction fix #563) —
+    a chain like origin -> dataflow -> staging table -> stored procedure ->
+    warehouse table -> semantic model -> measure -> report visual is already
+    *in* the graph, just buried under everything unrelated to it.
+
+    Generic on purpose (no relation name is hardcoded to any one domain): the
+    walk follows every outgoing/incoming edge regardless of its `relation`
+    label, since graphify serves any language/any repo and a lineage-shaped
+    corpus (ETL/BI, build pipelines, data contracts) is only one case of many.
+    The one exception is display: an edge whose relation name contains
+    "filter" (e.g. a Power BI `filters_by_column` slicer/report filter) is
+    highlighted amber in both the redrawn graph and the text list, since a
+    filter applied partway down a chain silently changes what the destination
+    node actually shows — exactly the kind of hop a plain neighbor list buries
+    among ordinary data-movement edges.
+
+    Rendering reuses the SAME `nodesDS`/`network` instance the main graph
+    uses (hide-everything-but-the-chain, matching `applyPattern`'s technique)
+    rather than standing up a second vis.Network: vis-network already drops
+    edges whose endpoint node is hidden, so no separate edge-visibility
+    bookkeeping is needed, and the existing legend/community sync in
+    `applyPattern` comes for free when the patterns panel is present (skipped,
+    with a manual fallback, in the aggregated community view where it isn't).
+    """
+    return """<script>
+(function() {
+  const byIdLineage = new Map(RAW_NODES.map(n => [n.id, n]));
+  // Adjacency keyed by the EDGE'S OWN endpoint role, not traversal direction:
+  // outAdj[x] lists edges where x is the source (used for the downstream
+  // walk), inAdj[x] lists edges where x is the target (used for the upstream
+  // walk). RAW_EDGES' from/to already carry the true logical direction
+  // (restored via _src/_tgt by the Python side), so no re-derivation here.
+  const outAdj = new Map();
+  const inAdj = new Map();
+  RAW_EDGES.forEach((e, i) => {
+    if (!outAdj.has(e.from)) outAdj.set(e.from, []);
+    outAdj.get(e.from).push(i);
+    if (!inAdj.has(e.to)) inAdj.set(e.to, []);
+    inAdj.get(e.to).push(i);
+  });
+
+  // Long enough to cover a realistic ETL/BI chain (source -> landing ->
+  // staging -> procedure -> warehouse table -> semantic model -> measure ->
+  // visual -> page -> report is ~10 hops) with headroom; the walk stops
+  // early on its own once a direction runs out of unvisited neighbors.
+  const LINEAGE_MAX_DEPTH = 15;
+
+  function isFilterRelation(rel) {
+    return /filter/i.test(rel || '');
+  }
+
+  // `forward`: true walks outAdj toward each edge's `to` (downstream); false
+  // walks inAdj toward each edge's `from` (upstream). Returns hop distance
+  // per visited node, positive downstream / negative upstream / 0 = start.
+  function walk(adj, startId, forward) {
+    const dist = new Map([[startId, 0]]);
+    let frontier = [startId];
+    for (let d = 1; d <= LINEAGE_MAX_DEPTH && frontier.length; d++) {
+      const next = [];
+      frontier.forEach(nid => {
+        (adj.get(nid) || []).forEach(ei => {
+          const other = forward ? RAW_EDGES[ei].to : RAW_EDGES[ei].from;
+          if (!dist.has(other)) {
+            dist.set(other, forward ? d : -d);
+            next.push(other);
+          }
+        });
+      });
+      frontier = next;
+    }
+    return dist;
+  }
+
+  let lineageActive = false;
+  let originalEdgeStyles = null;
+
+  function restoreEdgeStyles() {
+    if (originalEdgeStyles) {
+      edgesDS.update(originalEdgeStyles);
+      originalEdgeStyles = null;
+    }
+  }
+
+  function exitLineage() {
+    if (!lineageActive) return;
+    lineageActive = false;
+    restoreEdgeStyles();
+    if (window.__clearActivePattern) window.__clearActivePattern();
+    toggleAllCommunities(false);
+    network.setOptions({ physics: DEFAULT_PHYSICS, layout: { hierarchical: false } });
+    network.fit({ animation: { duration: 400, easingFunction: 'easeInOutQuad' } });
+    document.getElementById('lineage-wrap').style.display = 'none';
+    const patternsWrap = document.getElementById('patterns-wrap');
+    if (patternsWrap) patternsWrap.style.display = '';
+    document.getElementById('legend-wrap').style.display = '';
+  }
+
+  function traceLineage(startId) {
+    const startNode = byIdLineage.get(startId);
+    if (!startNode) return;
+    restoreEdgeStyles();
+    lineageActive = true;
+
+    const downDist = walk(outAdj, startId, true);
+    const dist = new Map(downDist);
+    walk(inAdj, startId, false).forEach((d, nid) => {
+      if (!dist.has(nid)) dist.set(nid, d);
+    });
+    const idSet = new Set(dist.keys());
+
+    if (window.applyPattern) {
+      // Also syncs the community legend and does an initial fit — the
+      // hierarchical re-layout below fits again once positions settle.
+      window.applyPattern(idSet, null);
+    } else {
+      nodesDS.update(RAW_NODES.map(n => ({ id: n.id, hidden: !idSet.has(n.id) })));
+    }
+
+    // The induced subgraph over the visited nodes — not just the BFS
+    // traversal tree — so a lateral edge between two chain nodes (e.g. two
+    // sibling stored procedures both reading the same staging table) still
+    // renders, matching how the MCP query engine treats a traversal result.
+    const inducedEdgeIdxs = [];
+    RAW_EDGES.forEach((e, i) => {
+      if (dist.has(e.from) && dist.has(e.to)) inducedEdgeIdxs.push(i);
+    });
+
+    const styleUpdates = [];
+    originalEdgeStyles = [];
+    inducedEdgeIdxs.forEach(i => {
+      if (!isFilterRelation(RAW_EDGES[i].label)) return;
+      const cur = edgesDS.get(i);
+      if (!cur) return;
+      originalEdgeStyles.push({ id: i, color: cur.color, width: cur.width, dashes: cur.dashes });
+      styleUpdates.push({ id: i, color: { color: '#f59e0b', opacity: 0.9 }, width: 3, dashes: [4, 3] });
+    });
+    if (styleUpdates.length) edgesDS.update(styleUpdates);
+
+    network.setOptions({
+      physics: { enabled: false },
+      layout: { hierarchical: { enabled: true, direction: 'LR', sortMethod: 'directed', levelSeparation: 220, nodeSpacing: 90, treeSpacing: 140 } },
+    });
+    setTimeout(() => network.fit({ nodes: Array.from(idSet), animation: { duration: 400, easingFunction: 'easeInOutQuad' } }), 60);
+
+    const patternsWrap = document.getElementById('patterns-wrap');
+    if (patternsWrap) patternsWrap.style.display = 'none';
+    document.getElementById('legend-wrap').style.display = 'none';
+    const wrap = document.getElementById('lineage-wrap');
+    wrap.style.display = 'flex';
+    document.getElementById('lineage-title').textContent = startNode.label;
+
+    const ordered = Array.from(dist.entries()).sort((a, b) => a[1] - b[1]);
+    document.getElementById('lineage-chain').innerHTML = ordered.map(([nid, d]) => {
+      const n = byIdLineage.get(nid);
+      if (!n) return '';
+      const marker = nid === startId ? '&#9679;' : (d < 0 ? '&#8593;' : '&#8595;');
+      const distLabel = d === 0 ? 'selected' : (d < 0 ? `${-d} upstream` : `${d} downstream`);
+      return `<div class="lineage-hop" data-nid="${esc(nid)}" style="border-left-color:${esc(n.color.background)}">` +
+        `<span class="lineage-hop-marker">${marker}</span>` +
+        `<span class="lineage-hop-label">${esc(n.label)}</span>` +
+        `<span class="lineage-hop-dist">${esc(distLabel)}</span></div>`;
+    }).join('');
+
+    document.getElementById('lineage-edges').innerHTML = inducedEdgeIdxs.map(i => {
+      const e = RAW_EDGES[i];
+      const fromN = byIdLineage.get(e.from);
+      const toN = byIdLineage.get(e.to);
+      if (!fromN || !toN) return '';
+      const filter = isFilterRelation(e.label);
+      const ctx = e.context ? ` &mdash; ${esc(e.context)}` : '';
+      return `<div class="lineage-edge${filter ? ' filter' : ''}">` +
+        `${filter ? '&#128269; ' : ''}${esc(fromN.label)} <b>&rarr;${e.label ? ' ' + esc(e.label) : ''} &rarr;</b> ${esc(toN.label)}${ctx}</div>`;
+    }).join('');
+  }
+
+  document.addEventListener('click', e => {
+    const trigger = e.target.closest('.lineage-trigger');
+    if (trigger && trigger.dataset.nid !== undefined) {
+      traceLineage(trigger.dataset.nid);
+      return;
+    }
+    const hop = e.target.closest('.lineage-hop');
+    if (hop && hop.dataset.nid !== undefined) {
+      focusNode(hop.dataset.nid);
+      return;
+    }
+    if (e.target.closest('#lineage-exit-btn')) exitLineage();
   });
 })();
 </script>"""
@@ -845,6 +1069,13 @@ def to_html(
     <h3>Node Info</h3>
     <div id="info-content"><span class="empty">Click a node to inspect it</span></div>
   </div>
+  <div id="lineage-wrap">
+    <h3>Lineage: <span id="lineage-title"></span></h3>
+    <button id="lineage-exit-btn">&#8630; Back to full graph</button>
+    <div id="lineage-chain"></div>
+    <div id="lineage-edges-title">Relations</div>
+    <div id="lineage-edges"></div>
+  </div>
 {patterns_panel_html}  <div id="legend-wrap">
     <h3>Communities</h3>
     <div id="legend-controls">
@@ -857,6 +1088,7 @@ def to_html(
 {_html_script(nodes_json, edges_json, legend_json)}
 {_hyperedge_script(hyperedges_json)}
 {patterns_script_html}
+{_lineage_script()}
 </body>
 </html>"""
 

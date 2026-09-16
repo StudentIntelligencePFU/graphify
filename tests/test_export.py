@@ -1028,7 +1028,57 @@ def test_to_html_patterns_panel_absent_in_aggregated_view(tmp_path):
     content = out.read_text()
     assert '<div id="patterns-wrap">' not in content
     assert '<select id="subgroup-select">' not in content
-    assert "window.applyPattern" not in content
+    # The patterns script itself (which DEFINES window.applyPattern) must be
+    # skipped — not just any mention of the name: the lineage panel (present
+    # in both views) feature-detects it with `if (window.applyPattern)`, so
+    # that guard alone must not trip this assertion.
+    assert "window.applyPattern = applyPattern" not in content
+
+
+def test_to_html_lineage_panel_present_in_full_detail_view(tmp_path):
+    """The trace-lineage panel (upstream/downstream chain from a selected
+    node) ships in a true per-node render, alongside its trigger button on
+    the node-info panel and the filter-edge highlighting helper."""
+    G = make_graph()
+    communities = cluster(G)
+    out = tmp_path / "graph.html"
+    to_html(G, communities, str(out))
+    content = out.read_text()
+    assert '<div id="lineage-wrap">' in content
+    assert '<button id="lineage-exit-btn">' in content
+    assert 'class="lineage-trigger"' in content
+    assert "function traceLineage" in content
+    assert "isFilterRelation" in content
+
+
+def test_to_html_lineage_panel_present_in_aggregated_view(tmp_path):
+    """Unlike the patterns panel, lineage tracing is still meaningful over the
+    aggregated community-meta-graph (each meta-node is a whole community, but
+    "where does this community's data come from / go to" is still a sensible
+    question), so it ships there too — via the manual hide/show fallback
+    since window.applyPattern isn't defined in that view."""
+    G = make_graph()
+    communities = cluster(G)
+    member_counts = {cid: len(members) for cid, members in communities.items()}
+    out = tmp_path / "graph.html"
+    to_html(G, communities, str(out), member_counts=member_counts)
+    content = out.read_text()
+    assert '<div id="lineage-wrap">' in content
+    assert "function traceLineage" in content
+
+
+def test_to_html_lineage_trigger_has_no_inline_onclick_xss(tmp_path):
+    """The lineage trigger button carries the node id via a data attribute
+    read back by a delegated listener, not an inline onclick — the same fix
+    applied to neighbor links in #1838 for the same reason: a node id/label
+    sourced from a scraped document can contain a double-quote."""
+    G = make_graph()
+    communities = cluster(G)
+    out = tmp_path / "graph.html"
+    to_html(G, communities, str(out))
+    content = out.read_text()
+    assert 'onclick="traceLineage(' not in content
+    assert "e.target.closest('.lineage-trigger')" in content
 
 
 def test_to_html_patterns_reads_unprefixed_raw_node_fields(tmp_path):
