@@ -193,10 +193,12 @@ const edgesDS = new vis.DataSet(RAW_EDGES.map((e, i) => ({{
   _relation: e.label, _context: e.context || '',
 }})));
 
-// Shared with the lineage view (_lineage_script), which switches the network
-// to a hierarchical layout with physics off while tracing a chain and must
-// restore EXACTLY this config on exit — a second, drifted copy of these
-// numbers would silently diverge from the graph's normal resting layout.
+// Shared with the lineage view (_lineage_script), which re-enables physics
+// briefly to settle newly-revealed nodes on each expansion (never a fixed
+// hierarchical layout — that locks every node to a column, blocking free
+// dragging) and must restore EXACTLY this config on exit — a second,
+// drifted copy of these numbers would silently diverge from the graph's
+// normal resting layout.
 const DEFAULT_PHYSICS = {{
   enabled: true,
   solver: 'forceAtlas2Based',
@@ -570,6 +572,10 @@ def _lineage_script() -> str:
     direct neighbors to the canvas; clicking the button again on one of those
     newly-revealed nodes extends the picture from there. The user decides
     which branch is worth following instead of being shown all of them.
+    Positioning uses physics (`DEFAULT_PHYSICS`), not a fixed hierarchical
+    layout: hierarchical mode locks each node to its computed column, so it
+    can only be dragged along one axis — the opposite of letting the user
+    freely rearrange a view they are actively building up click by click.
 
     Two things still make a full-graph render useless for answering "where
     does this data come from / end up, and what filters it along the way":
@@ -749,17 +755,22 @@ def _lineage_script() -> str:
     directNeighbors(id).forEach(nid => visibleIds.add(nid));
 
     if (window.applyPattern) {
-      // Also syncs the community legend and does an initial fit — the
-      // hierarchical re-layout below fits again once positions settle.
+      // Also syncs the community legend and does an initial fit.
       window.applyPattern(visibleIds, null);
     } else {
       nodesDS.update(RAW_NODES.map(n => ({ id: n.id, hidden: !visibleIds.has(n.id) })));
     }
 
-    network.setOptions({
-      physics: { enabled: false },
-      layout: { hierarchical: { enabled: true, direction: 'LR', sortMethod: 'directed', levelSeparation: 220, nodeSpacing: 90, treeSpacing: 140 } },
-    });
+    // Physics, not a fixed hierarchical layout: vis-network's hierarchical
+    // mode locks each node to its computed level (its column, in LR
+    // direction) — a node can only be dragged along the OTHER axis, not
+    // repositioned freely, and re-running it on every expansion click would
+    // re-lay out every visible node from scratch, discarding any manual
+    // dragging the user just did to make room. Physics only nudges around
+    // newly-revealed connections and settles once, leaving every node
+    // completely free to drag afterward — nothing about the view is locked.
+    network.setOptions({ physics: DEFAULT_PHYSICS, layout: { hierarchical: false } });
+    network.once('stabilizationIterationsDone', () => network.setOptions({ physics: { enabled: false } }));
     setTimeout(() => network.fit({ nodes: Array.from(visibleIds), animation: { duration: 400, easingFunction: 'easeInOutQuad' } }), 60);
 
     const patternsWrap = document.getElementById('patterns-wrap');
