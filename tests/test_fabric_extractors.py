@@ -225,7 +225,10 @@ def test_fabric_config_extraction(tmp_path: Path):
     pbir_file.write_text('{"datasetReference": {"byConnection": {"connectionString": "Data Source=\\"pbiazure\\";initial catalog=\\"SalesModel\\""}}}', encoding="utf-8")
     res_pbir = extract_fabric_config(pbir_file)
     assert any("SalesModel" in n["label"] for n in res_pbir["nodes"])
-    assert any(e["relation"] == "references" for e in res_pbir["edges"])
+    # Same relation name pbir.py's own datasetReference re-emit uses (see its
+    # module docstring: "Report -> targets_semantic_model -> SemanticModel") —
+    # not "references", which this test asserted before ever being run.
+    assert any(e["relation"] == "targets_semantic_model" for e in res_pbir["edges"])
 
 
 def test_powerquery_quoted_query_names_with_spaces(tmp_path: Path):
