@@ -14,6 +14,16 @@ at write time):
   `shared_sql` `ExecutePassThroughNativeQuery_V2` actions. This is Workflow
   Definition Language, not the M `Sql.Database(...)` Dataflows use — see
   `graphify.extractors.powerquery` for that side of the same technique.
+- §4.5 Excel: `Flow --reads_from/writes_to--> ExcelTable: <file>/<table>` from
+  `shared_excelonlinebusiness` GetItems/GetItem (reads) and AddRowV2 (writes).
+  Also: `ExcelFile: <file> --contains--> ExcelTable: <file>/<table>`.
+- §4.5 Forms: `Form: <form_id> --triggers--> Flow` from `shared_microsoftforms`
+  CreateFormWebhook triggers, and `Flow --reads_from--> Form: <form_id>` from
+  GetFormResponseById actions.
+- §4.5 OneDrive: `Flow --writes_to--> OneDriveFolder: <folderPath>` from
+  `shared_onedriveforbusiness` CreateFile with literal folderPath.
+- §4.5 SharePoint: `Flow --writes_to--> SharePointSite: <dataset>` from
+  `shared_sharepointonline` CreateFile with literal dataset.
 - §4.7 Connections: `Flow --uses--> Connection: <displayName>`, excluding
   `shared_logicflows` (the internal "Run a Child Flow" plumbing, not a real
   credential — see the module-level note on `_SHARED_LOGICFLOWS_API_ID`).
@@ -21,9 +31,10 @@ at write time):
 
 Deliberately NOT built here (left for v2 — needs indirection-resolution
 `_env_map.json` doesn't carry data for yet): Power BI dataset/report reads
-(§4.2), Dataverse/AI Builder (§4.3), child-flow calls (§4.4), triggers /
-SharePoint-OneDrive writes (§4.5, §4.5bis), Fabric pipeline/notebook calls
-(§4.6).
+(§4.2), Dataverse/AI Builder (§4.3), child-flow calls (§4.4), RunScriptProd
+Excel operations (§4.5 omitted: file parameter is always a WDL expression),
+CreateFile.name on OneDrive/SharePoint (omitted: always expression), Fabric
+pipeline/notebook calls (§4.6).
 
 Only `metadata.json` mints nodes — it is the file that "owns" the Flow entity,
 and it reads its siblings (`definition.json`, `connections.json`) and its
@@ -66,6 +77,30 @@ _SHARED_LOGICFLOWS_API_ID = "shared_logicflows"
 # is compared exactly.
 _SQL_API_ID_SUFFIX = "/shared_sql"
 _SQL_OPERATION_ID = "ExecutePassThroughNativeQuery_V2"
+
+# Excel Online (Business): §4.5 operations on ExcelTable. Measure: 8 AddRowV2 (writes),
+# 25 GetItems (reads), 4 GetItem (reads) across 51 flows. RunScriptProd is deliberately
+# left out because its `file` parameter is always a WDL expression, never a literal.
+_EXCEL_API_ID_SUFFIX = "/shared_excelonlinebusiness"
+_EXCEL_ADDROW_OPERATION_ID = "AddRowV2"
+_EXCEL_GETITEMS_OPERATION_ID = "GetItems"
+_EXCEL_GETITEM_OPERATION_ID = "GetItem"
+
+# Forms: §4.5 triggers and §4.5bis read operations. Real data: 4 CreateFormWebhook
+# triggers (form_id literal), 4 GetFormResponseById actions (form_id literal).
+_FORMS_API_ID_SUFFIX = "/shared_microsoftforms"
+_FORMS_WEBHOOK_OPERATION_ID = "CreateFormWebhook"
+_FORMS_GET_RESPONSE_OPERATION_ID = "GetFormResponseById"
+
+# OneDrive for Business: §4.5 CreateFile writes with folderPath literal.
+# Real data: 23 literal folderPath (written to), 16 expression folderPath (omitted).
+_ONEDRIVE_API_ID_SUFFIX = "/shared_onedriveforbusiness"
+_ONEDRIVE_CREATEFILE_OPERATION_ID = "CreateFile"
+
+# SharePoint Online: §4.5 CreateFile writes with dataset literal.
+# Real data: 1 literal dataset (written to), 1 expression dataset (omitted).
+_SHAREPOINT_API_ID_SUFFIX = "/shared_sharepointonline"
+_SHAREPOINT_CREATEFILE_OPERATION_ID = "CreateFile"
 
 # Schema-qualified table reference immediately after a DML/query keyword, e.g.
 # `FROM [dm].[(Hec)_VOC_HLO_Respuestas]` or `INSERT INTO dbo.Log`. Mirrors
@@ -390,16 +425,27 @@ def extract_powerautomate(path: Path, content: str | bytes | None = None) -> dic
     )
 
     # ---- §4.1 SQL: Flow --reads_from/writes_to--> esquema.tabla ----
+    # §4.5 Excel: Flow --reads_from/writes_to--> ExcelTable: <file>/<table>
+    # §4.5 Forms: Form: <form_id> --triggers--> Flow (§4.5 trigger)
+    #            Flow --reads_from--> Form: <form_id> (§4.5bis read)
+    # §4.5 OneDrive: Flow --writes_to--> OneDriveFolder: <folderPath>
+    # §4.5 SharePoint: Flow --writes_to--> SharePointSite: <dataset>
+    # §4.5 Excel-file containment: ExcelFile: <file> --contains--> ExcelTable: <file>/<table>
     definition_path = flow_dir / "definition.json"
     try:
         if definition_path.exists():
             definition = json.loads(_read_text_safe(definition_path))
             if isinstance(definition, dict):
-                roots = (definition.get("triggers"), definition.get("actions"))
-                for root in roots:
-                    if not isinstance(root, dict):
-                        continue
-                    for action_name, action in _iter_actions(root):
+                # Track deduplication for extended lineage (Excel, Forms, OneDrive, SharePoint).
+                # SQL is NOT deduplicated — each table reference emits its own edge, maintaining
+                # the original behavior where multiple SQL actions or multiple tables in one query
+                # result in separate edges (e.g. two CTEs reading from the same table = 2 edges).
+                dedup_edges: dict[tuple[str, str, str], str] = {}
+
+                # Process triggers (distinct from actions for Form webhooks)
+                trigger_root = definition.get("triggers")
+                if isinstance(trigger_root, dict):
+                    for action_name, action in _iter_actions(trigger_root):
                         inputs = action.get("inputs")
                         if not isinstance(inputs, dict):
                             continue
@@ -407,22 +453,152 @@ def extract_powerautomate(path: Path, content: str | bytes | None = None) -> dic
                         if not isinstance(host, dict):
                             continue
                         api_id = str(host.get("apiId") or "")
-                        if not api_id.endswith(_SQL_API_ID_SUFFIX):
-                            continue
-                        if host.get("operationId") != _SQL_OPERATION_ID:
-                            continue
+                        operation_id = str(host.get("operationId") or "")
                         parameters = inputs.get("parameters")
-                        query = parameters.get("query/query") if isinstance(parameters, dict) else None
-                        if not isinstance(query, str):
+                        if not isinstance(parameters, dict):
+                            parameters = {}
+
+                        # SQL action (native query, triggers rarely use this but possible)
+                        if api_id.endswith(_SQL_API_ID_SUFFIX):
+                            if operation_id == _SQL_OPERATION_ID:
+                                query = parameters.get("query/query")
+                                if isinstance(query, str):
+                                    for schema, table, relation in _tables_from_sql(query):
+                                        table_nid = _ref_stub(f"{schema}.{table}")
+                                        _add_edge(flow_nid, table_nid, relation,
+                                                  context=f"shared_sql action={action_name}")
+
+                        # Forms webhook trigger: Form --triggers--> Flow (note: reversed direction)
+                        elif api_id.endswith(_FORMS_API_ID_SUFFIX):
+                            if operation_id == _FORMS_WEBHOOK_OPERATION_ID:
+                                form_id = parameters.get("form_id")
+                                if isinstance(form_id, str) and not form_id.startswith("@"):
+                                    form_nid = _ref_stub(f"Form: {form_id}")
+                                    dedup_key = (form_nid, "triggers", flow_nid)
+                                    if dedup_key not in dedup_edges:
+                                        dedup_edges[dedup_key] = f"forms trigger={action_name}"
+
+                # Process actions
+                actions_root = definition.get("actions")
+                if isinstance(actions_root, dict):
+                    for action_name, action in _iter_actions(actions_root):
+                        inputs = action.get("inputs")
+                        if not isinstance(inputs, dict):
                             continue
-                        for schema, table, relation in _tables_from_sql(query):
-                            table_nid = _ref_stub(f"{schema}.{table}")
-                            _add_edge(flow_nid, table_nid, relation,
-                                      context=f"shared_sql action={action_name}")
+                        host = inputs.get("host")
+                        if not isinstance(host, dict):
+                            continue
+                        api_id = str(host.get("apiId") or "")
+                        operation_id = str(host.get("operationId") or "")
+                        parameters = inputs.get("parameters")
+                        if not isinstance(parameters, dict):
+                            parameters = {}
+
+                        # SQL action
+                        if api_id.endswith(_SQL_API_ID_SUFFIX):
+                            if operation_id == _SQL_OPERATION_ID:
+                                query = parameters.get("query/query")
+                                if isinstance(query, str):
+                                    for schema, table, relation in _tables_from_sql(query):
+                                        table_nid = _ref_stub(f"{schema}.{table}")
+                                        _add_edge(flow_nid, table_nid, relation,
+                                                  context=f"shared_sql action={action_name}")
+
+                        # Excel operations
+                        elif api_id.endswith(_EXCEL_API_ID_SUFFIX):
+                            # AddRowV2 writes to ExcelTable
+                            if operation_id == _EXCEL_ADDROW_OPERATION_ID:
+                                drive = parameters.get("drive")
+                                file_id = parameters.get("file")
+                                table = parameters.get("table")
+                                source = parameters.get("source")
+                                if (isinstance(drive, str) and not drive.startswith("@") and
+                                    isinstance(file_id, str) and not file_id.startswith("@") and
+                                    isinstance(table, str) and not table.startswith("@")):
+                                    extra_attrs = {"drive": drive}
+                                    if isinstance(source, str) and not source.startswith("@"):
+                                        extra_attrs["source"] = source
+                                    table_nid = _ref_stub(f"ExcelTable: {file_id}/{table}",
+                                                        extra=extra_attrs)
+                                    file_nid = _ref_stub(f"ExcelFile: {file_id}")
+                                    dedup_key = (flow_nid, "writes_to", table_nid)
+                                    if dedup_key not in dedup_edges:
+                                        dedup_edges[dedup_key] = f"excel action={action_name}"
+                                    dedup_file_key = (file_nid, "contains", table_nid)
+                                    if dedup_file_key not in dedup_edges:
+                                        dedup_edges[dedup_file_key] = "excel_table_of_file"
+
+                            # GetItems and GetItem read from ExcelTable
+                            elif operation_id in (_EXCEL_GETITEMS_OPERATION_ID, _EXCEL_GETITEM_OPERATION_ID):
+                                drive = parameters.get("drive")
+                                file_id = parameters.get("file")
+                                table = parameters.get("table")
+                                source = parameters.get("source")
+                                if (isinstance(drive, str) and not drive.startswith("@") and
+                                    isinstance(file_id, str) and not file_id.startswith("@") and
+                                    isinstance(table, str) and not table.startswith("@")):
+                                    extra_attrs = {"drive": drive}
+                                    if isinstance(source, str) and not source.startswith("@"):
+                                        extra_attrs["source"] = source
+                                    table_nid = _ref_stub(f"ExcelTable: {file_id}/{table}",
+                                                        extra=extra_attrs)
+                                    file_nid = _ref_stub(f"ExcelFile: {file_id}")
+                                    dedup_key = (flow_nid, "reads_from", table_nid)
+                                    if dedup_key not in dedup_edges:
+                                        dedup_edges[dedup_key] = f"excel action={action_name}"
+                                    dedup_file_key = (file_nid, "contains", table_nid)
+                                    if dedup_file_key not in dedup_edges:
+                                        dedup_edges[dedup_file_key] = "excel_table_of_file"
+
+                        # Forms read operation
+                        elif api_id.endswith(_FORMS_API_ID_SUFFIX):
+                            if operation_id == _FORMS_GET_RESPONSE_OPERATION_ID:
+                                form_id = parameters.get("form_id")
+                                if isinstance(form_id, str) and not form_id.startswith("@"):
+                                    form_nid = _ref_stub(f"Form: {form_id}")
+                                    # The graph is undirected. If a flow reads from a form that also
+                                    # triggers it (same form_id), two edges between the same pair of
+                                    # nodes would collapse to one during build, with the last-written
+                                    # relation winning. To preserve the more informative "triggers"
+                                    # relation (which directly answers "what fires this form?"), we
+                                    # omit the redundant "reads_from" edge when a trigger exists for
+                                    # the same (form, flow) pair. A flow reading from a form that does
+                                    # NOT trigger it is legitimate and is emitted normally.
+                                    trigger_key = (form_nid, "triggers", flow_nid)
+                                    if trigger_key in dedup_edges:
+                                        # This form triggered the flow; the reads_from edge is redundant.
+                                        continue
+                                    dedup_key = (flow_nid, "reads_from", form_nid)
+                                    if dedup_key not in dedup_edges:
+                                        dedup_edges[dedup_key] = f"forms action={action_name}"
+
+                        # OneDrive CreateFile write
+                        elif api_id.endswith(_ONEDRIVE_API_ID_SUFFIX):
+                            if operation_id == _ONEDRIVE_CREATEFILE_OPERATION_ID:
+                                folder_path = parameters.get("folderPath")
+                                if isinstance(folder_path, str) and not folder_path.startswith("@"):
+                                    folder_nid = _ref_stub(f"OneDriveFolder: {folder_path}")
+                                    dedup_key = (flow_nid, "writes_to", folder_nid)
+                                    if dedup_key not in dedup_edges:
+                                        dedup_edges[dedup_key] = f"onedrive action={action_name}"
+
+                        # SharePoint CreateFile write
+                        elif api_id.endswith(_SHAREPOINT_API_ID_SUFFIX):
+                            if operation_id == _SHAREPOINT_CREATEFILE_OPERATION_ID:
+                                dataset = parameters.get("dataset")
+                                if isinstance(dataset, str) and not dataset.startswith("@"):
+                                    site_nid = _ref_stub(f"SharePointSite: {dataset}")
+                                    dedup_key = (flow_nid, "writes_to", site_nid)
+                                    if dedup_key not in dedup_edges:
+                                        dedup_edges[dedup_key] = f"sharepoint action={action_name}"
+
+                # Emit deduplicated edges for extended lineage (Excel, Forms, OneDrive, SharePoint)
+                for (src, relation, tgt), context in dedup_edges.items():
+                    _add_edge(src, tgt, relation, context=context)
     except (OSError, json.JSONDecodeError):
         # A missing/malformed sibling definition.json must not cost the Flow
         # node its other edges (Connections, Solutions) — worst case this flow
-        # loses SQL lineage, which is exactly what an empty/broken file means.
+        # loses SQL and extended lineage, which is exactly what an empty/broken file means.
         pass
 
     # ---- §4.7 Connections: Flow --uses--> Connection: <label> ----

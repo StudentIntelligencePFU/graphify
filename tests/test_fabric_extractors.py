@@ -771,3 +771,932 @@ def test_powerautomate_uncollided_flow_label_has_no_suffix(tmp_path: Path):
     res = extract_powerautomate(metadata_path)
     labels = [n["label"] for n in res["nodes"] if n["label"].startswith("Flow: ")]
     assert labels == ["Flow: Matriculacion_OBS"]
+
+
+# =========================================================================
+# Tests for Power Automate §4.5/§4.5bis: Excel, Forms, OneDrive, SharePoint
+# =========================================================================
+
+def test_powerautomate_excel_addrowv2_writes_to_table(tmp_path: Path):
+    """Arista #1: Excel AddRowV2 action emits Flow --writes_to--> ExcelTable."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "AddRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "b!xxx",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                        "source": "me",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_Writer", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_Writer")
+
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+
+    assert "ExcelTable: 01QINSFHRPYXCOVOTJ/{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}" in writes
+
+
+def test_powerautomate_excel_getitems_reads_from_table(tmp_path: Path):
+    """Arista #2: Excel GetItems action emits Flow --reads_from--> ExcelTable."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "GetRows": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "GetItems",
+                    },
+                    "parameters": {
+                        "drive": "b!xyz",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_Reader", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_Reader")
+
+    reads = {by_id[e["target"]] for e in res["edges"]
+             if e["source"] == flow_id and e["relation"] == "reads_from"}
+
+    assert "ExcelTable: 01QINSFHRPYXCOVOTJ/{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}" in reads
+
+
+def test_powerautomate_excel_getitem_reads_from_table(tmp_path: Path):
+    """Arista #2 variant: Excel GetItem (singular) also emits reads_from."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "GetSingleRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "GetItem",
+                    },
+                    "parameters": {
+                        "drive": "b!abc",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_GetItem", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_GetItem")
+
+    reads = {by_id[e["target"]] for e in res["edges"]
+             if e["source"] == flow_id and e["relation"] == "reads_from"}
+
+    assert "ExcelTable: 01QINSFHRPYXCOVOTJ/{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}" in reads
+
+
+def test_powerautomate_excel_file_contains_table(tmp_path: Path):
+    """Arista #3: ExcelFile --contains--> ExcelTable for any table in that file."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "AddRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "b!xxx",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_Contains", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    contains_edges = [(by_id.get(e["source"]), by_id.get(e["target"]))
+                      for e in res["edges"] if e["relation"] == "contains"]
+
+    assert ("ExcelFile: 01QINSFHRPYXCOVOTJ",
+            "ExcelTable: 01QINSFHRPYXCOVOTJ/{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}") in contains_edges
+
+
+def test_powerautomate_forms_webhook_triggers_flow(tmp_path: Path):
+    """Arista #4: Forms CreateFormWebhook TRIGGER emits Form --triggers--> Flow (REVERSE direction)."""
+    definition = {
+        "triggers": {
+            "form_trigger": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "CreateFormWebhook",
+                    },
+                    "parameters": {
+                        "form_id": "abc123def456",
+                    },
+                },
+            },
+        },
+        "actions": {},
+    }
+    metadata_path = _make_flow(tmp_path, "Form_Trigger", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    triggers_edges = [(by_id.get(e["source"]), by_id.get(e["target"]))
+                      for e in res["edges"] if e["relation"] == "triggers"]
+
+    # Direction is Form --> Flow, not Flow --> Form
+    assert ("Form: abc123def456", "Flow: Form_Trigger") in triggers_edges
+
+
+def test_powerautomate_forms_getformresponse_reads_form(tmp_path: Path):
+    """Arista #5: Forms GetFormResponseById action emits Flow --reads_from--> Form."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "GetResponse": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "GetFormResponseById",
+                    },
+                    "parameters": {
+                        "form_id": "form-uuid-12345",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Form_Reader", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Form_Reader")
+
+    reads = {by_id[e["target"]] for e in res["edges"]
+             if e["source"] == flow_id and e["relation"] == "reads_from"}
+
+    assert "Form: form-uuid-12345" in reads
+
+
+def test_powerautomate_onedrive_createfile_writes_folder(tmp_path: Path):
+    """Arista #6: OneDrive CreateFile with literal folderPath emits writes_to OneDriveFolder."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "CreateFile": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_onedriveforbusiness",
+                        "operationId": "CreateFile",
+                    },
+                    "parameters": {
+                        "folderPath": "/Documents/Reports",
+                        "name": "@triggerBody()['filename']",  # expression, ignored
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "OneDrive_Writer", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: OneDrive_Writer")
+
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+
+    assert "OneDriveFolder: /Documents/Reports" in writes
+
+
+def test_powerautomate_sharepoint_createfile_writes_site(tmp_path: Path):
+    """Arista #7: SharePoint CreateFile with literal dataset emits writes_to SharePointSite."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "CreateFile": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+                        "operationId": "CreateFile",
+                    },
+                    "parameters": {
+                        "dataset": "sites/mysite",
+                        "folderPath": "/Shared Documents",
+                        "name": "@triggerBody()['name']",  # expression, ignored
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "SharePoint_Writer", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: SharePoint_Writer")
+
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+
+    assert "SharePointSite: sites/mysite" in writes
+
+
+def test_powerautomate_expression_parameters_no_edge(tmp_path: Path):
+    """Parameters starting with @ are WDL expressions, not literals -- NO edge emitted.
+    Test case: OneDrive CreateFile with expression folderPath."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "CreateFileExpr": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_onedriveforbusiness",
+                        "operationId": "CreateFile",
+                    },
+                    "parameters": {
+                        "folderPath": "@outputs('GetPath')['folder']",  # EXPRESSION
+                        "name": "@triggerBody()['filename']",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "OneDrive_ExprPath", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: OneDrive_ExprPath")
+
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+
+    # No OneDriveFolder node should exist because folderPath is an expression
+    assert not writes
+
+
+def test_powerautomate_runscriptprod_file_is_expression_no_edge(tmp_path: Path):
+    """Excel RunScriptProd file parameter is always an expression in real data.
+    Per SPEC: this action is out of scope (no edge emitted).
+
+    WARNING: This test does NOT verify the @-startswith guard for expressions.
+    RunScriptProd is filtered by operationId before parameter inspection,
+    so it passes even if the expression guard were deleted. The actual guard
+    is tested in test_powerautomate_excel_addrowv2_file_expression_no_edge
+    and similar tests for operations that ARE processed."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "RunScript": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "RunScriptProd",
+                    },
+                    "parameters": {
+                        "file": "@outputs('GetExcelFile')['fileId']",  # EXPRESSION
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_RunScript", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_RunScript")
+
+    edges = [e for e in res["edges"] if e["source"] == flow_id]
+
+    # No ExcelFile or ExcelTable edge; the action produced nothing
+    assert not edges
+
+
+def test_powerautomate_excel_addrowv2_file_expression_no_edge(tmp_path: Path):
+    """Golden rule: AddRowV2 with file = expression does NOT emit edge.
+
+    This tests the @-startswith guard on 'file' parameter of AddRowV2.
+    If the guard were removed (isinstance check without startswith),
+    a malformed ExcelTable and ExcelFile nodes would appear."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "AddRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "b!xxx",
+                        "file": "@outputs('Resolve_XLSX_Metadata')?['body/Id']",  # EXPRESSION
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                        "source": "me",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_File_Expr", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_File_Expr")
+
+    # No writes_to edge should exist
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+    assert not writes
+
+    # No ExcelTable or ExcelFile nodes should exist
+    labels = {n["label"] for n in res["nodes"]}
+    assert not any(l.startswith("ExcelTable:") for l in labels)
+    assert not any(l.startswith("ExcelFile:") for l in labels)
+
+
+def test_powerautomate_excel_getitems_file_expression_no_edge(tmp_path: Path):
+    """Golden rule: GetItems with file = expression does NOT emit edge.
+
+    Tests the @-startswith guard on 'file' parameter of GetItems.
+    If omitted, a fake ExcelTable node would be created."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "GetRows": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "GetItems",
+                    },
+                    "parameters": {
+                        "drive": "b!xyz",
+                        "file": "@triggerBody()['excelFileId']",  # EXPRESSION
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_GetItems_Expr", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_GetItems_Expr")
+
+    # No reads_from edge should exist
+    reads = {by_id[e["target"]] for e in res["edges"]
+             if e["source"] == flow_id and e["relation"] == "reads_from"}
+    assert not reads
+
+    # No ExcelTable or ExcelFile nodes
+    labels = {n["label"] for n in res["nodes"]}
+    assert not any(l.startswith("ExcelTable:") for l in labels)
+    assert not any(l.startswith("ExcelFile:") for l in labels)
+
+
+def test_powerautomate_excel_addrowv2_table_expression_no_edge(tmp_path: Path):
+    """Golden rule: AddRowV2 with table = expression does NOT emit edge.
+
+    Tests the @-startswith guard on 'table' parameter."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "AddRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "b!xxx",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "@outputs('DynamicTableLookup')['tableId']",  # EXPRESSION
+                        "source": "me",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_Table_Expr", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_Table_Expr")
+
+    # No writes_to edge
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+    assert not writes
+
+    # No ExcelTable or ExcelFile nodes
+    labels = {n["label"] for n in res["nodes"]}
+    assert not any(l.startswith("ExcelTable:") for l in labels)
+    assert not any(l.startswith("ExcelFile:") for l in labels)
+
+
+def test_powerautomate_excel_addrowv2_drive_expression_no_edge(tmp_path: Path):
+    """Golden rule: AddRowV2 with drive = expression does NOT emit edge.
+
+    Tests the @-startswith guard on 'drive' parameter."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "AddRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "@outputs('SelectDrive')['driveId']",  # EXPRESSION
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                        "source": "me",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Excel_Drive_Expr", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_Drive_Expr")
+
+    # No writes_to edge
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+    assert not writes
+
+    # No ExcelTable or ExcelFile nodes
+    labels = {n["label"] for n in res["nodes"]}
+    assert not any(l.startswith("ExcelTable:") for l in labels)
+    assert not any(l.startswith("ExcelFile:") for l in labels)
+
+
+def test_powerautomate_form_trigger_direction_verified(tmp_path: Path):
+    """Verify that Form --triggers--> Flow is the correct direction, not Flow --uses--> Form."""
+    definition = {
+        "triggers": {
+            "form_trigger": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "CreateFormWebhook",
+                    },
+                    "parameters": {"form_id": "survey-123"},
+                },
+            },
+        },
+        "actions": {},
+    }
+    metadata_path = _make_flow(tmp_path, "Form_Trigger_Dir", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Form_Trigger_Dir")
+    form_id = next((n["id"] for n in res["nodes"] if n["label"] == "Form: survey-123"), None)
+
+    assert form_id is not None, "Form node not found"
+
+    # Check that the edge goes FROM Form TO Flow, not the other way around
+    edge = next((e for e in res["edges"] if e["relation"] == "triggers"), None)
+    assert edge is not None
+    assert edge["source"] == form_id, "triggers edge source should be Form"
+    assert edge["target"] == flow_id, "triggers edge target should be Flow"
+
+
+def test_powerautomate_deduplication_same_destination(tmp_path: Path):
+    """Two actions writing to the same Excel table = one writes_to edge, not two."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "AddRow1": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "b!x1",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                    },
+                },
+            },
+            "AddRow2": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "b!x2",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Dedup_Test", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Dedup_Test")
+
+    writes_edges = [e for e in res["edges"]
+                    if e["source"] == flow_id and e["relation"] == "writes_to"]
+    target_labels = [by_id[e["target"]] for e in writes_edges]
+
+    # Only one edge to the table, even though two actions target it
+    assert target_labels.count("ExcelTable: 01QINSFHRPYXCOVOTJ/{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}") == 1
+
+
+def test_powerautomate_legacy_edges_coexist_with_new(tmp_path: Path):
+    """SQL edges, Connection edges, and Solution edges must still be present
+    when a flow also has new Excel/Forms actions -- the new code hasn't broken the old."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "Run_SQL": _sql_action("SELECT * FROM [dbo].[Table1]"),
+            "AddExcelRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {
+                        "drive": "b!xxx",
+                        "file": "01QINSFHRPYXCOVOTJ",
+                        "table": "{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}",
+                    },
+                },
+            },
+        },
+    }
+    connections = {
+        "shared_sql": {"connectionName": "sql-guid", "id": "/providers/Microsoft.PowerApps/apis/shared_sql"},
+    }
+    metadata_path = _make_flow(
+        tmp_path, "Mixed_Actions",
+        definition=definition,
+        connections=connections,
+        metadata={"solutions": ["Active"], "managedSolutions": []},
+    )
+    (tmp_path / "power-automate" / "grupo-planeta" / "_connections.json").write_text(
+        json.dumps({"sql-guid": {"apiId": "shared_sql", "displayName": "SQL Db", "status": "Connected"}}),
+        encoding="utf-8"
+    )
+
+    res = extract_powerautomate(metadata_path)
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Mixed_Actions")
+
+    # SQL edge must still be present (old functionality)
+    reads = {by_id[e["target"]] for e in res["edges"]
+             if e["source"] == flow_id and e["relation"] == "reads_from"}
+    assert "dbo.Table1" in reads
+
+    # Connection edge must still be present
+    uses = {by_id[e["target"]] for e in res["edges"]
+            if e["source"] == flow_id and e["relation"] == "uses"}
+    assert any("Connection: shared_sql" in label for label in uses)
+
+    # Solution edge must still be present
+    belongs = {by_id[e["target"]] for e in res["edges"]
+               if e["source"] == flow_id and e["relation"] == "belongs_to"}
+    assert "Solution: Active" in belongs
+
+    # NEW Excel edge must also be present
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+    assert "ExcelTable: 01QINSFHRPYXCOVOTJ/{BA542B0E-ECA1-4C64-9D21-8F1D7F3C2A55}" in writes
+
+
+def test_powerautomate_excel_file_same_node_multiple_tables(tmp_path: Path):
+    """Two tables from the same Excel file both hang from the SAME ExcelFile node.
+    Per SPEC: ExcelFile: <file> --contains--> ExcelTable for each table."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "ReadTable1": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "GetItems",
+                    },
+                    "parameters": {
+                        "drive": "b!x1",
+                        "file": "01QINSFHRY7OL7G6O4",
+                        "table": "{TABLE1-GUID}",
+                    },
+                },
+            },
+            "ReadTable2": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "GetItems",
+                    },
+                    "parameters": {
+                        "drive": "b!x2",
+                        "file": "01QINSFHRY7OL7G6O4",
+                        "table": "{TABLE2-GUID}",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Multi_Table", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    excel_file_id = next((n["id"] for n in res["nodes"] if n["label"] == "ExcelFile: 01QINSFHRY7OL7G6O4"), None)
+
+    assert excel_file_id is not None, "ExcelFile node not created"
+
+    # Both tables must be contained by the SAME ExcelFile node
+    contains_edges = [e for e in res["edges"]
+                      if e["source"] == excel_file_id and e["relation"] == "contains"]
+    target_labels = [by_id[e["target"]] for e in contains_edges]
+
+    assert len(target_labels) == 2
+    assert "ExcelTable: 01QINSFHRY7OL7G6O4/{TABLE1-GUID}" in target_labels
+    assert "ExcelTable: 01QINSFHRY7OL7G6O4/{TABLE2-GUID}" in target_labels
+
+
+def test_powerautomate_forms_createformwebhook_form_id_expression_no_edge(tmp_path: Path):
+    """Golden rule: CreateFormWebhook (trigger) with form_id = expression
+    does NOT emit triggers edge nor Form: node.
+
+    Tests the @-startswith guard on 'form_id' parameter of CreateFormWebhook.
+    If removed, a fake Form node and triggers edge would be created."""
+    definition = {
+        "triggers": {
+            "form_webhook": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "CreateFormWebhook",
+                    },
+                    "parameters": {
+                        "form_id": "@triggerOutputs()?['body/formId']",  # EXPRESSION
+                    },
+                },
+            },
+        },
+        "actions": {},
+    }
+    metadata_path = _make_flow(tmp_path, "Form_Webhook_Expr", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Form_Webhook_Expr")
+
+    # No triggers edge should exist
+    triggers_edges = [e for e in res["edges"]
+                      if (e["source"] == flow_id or e["target"] == flow_id)
+                      and e["relation"] == "triggers"]
+    assert not triggers_edges, "Unexpected triggers edge found"
+
+    # No Form: nodes should exist
+    labels = {n["label"] for n in res["nodes"]}
+    form_nodes = [l for l in labels if l.startswith("Form:")]
+    assert not form_nodes, f"Unexpected Form nodes found: {form_nodes}"
+
+
+def test_powerautomate_forms_getformresponse_form_id_expression_no_edge(tmp_path: Path):
+    """Golden rule: GetFormResponseById (action) with form_id = expression
+    does NOT emit reads_from edge nor Form: node.
+
+    Tests the @-startswith guard on 'form_id' parameter of GetFormResponseById."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "GetResponse": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "GetFormResponseById",
+                    },
+                    "parameters": {
+                        "form_id": "@outputs('DynamicFormLookup')?['formId']",  # EXPRESSION
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Form_Response_Expr", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Form_Response_Expr")
+
+    # No reads_from edge from flow to a Form
+    reads_edges = [e for e in res["edges"]
+                   if e["source"] == flow_id and e["relation"] == "reads_from"]
+    target_labels = [by_id.get(e["target"], "") for e in reads_edges]
+    form_reads = [l for l in target_labels if l.startswith("Form:")]
+    assert not form_reads, f"Unexpected Form reads_from found: {form_reads}"
+
+    # No Form: nodes should exist
+    labels = {n["label"] for n in res["nodes"]}
+    form_nodes = [l for l in labels if l.startswith("Form:")]
+    assert not form_nodes, f"Unexpected Form nodes found: {form_nodes}"
+
+
+def test_powerautomate_sharepoint_createfile_dataset_expression_no_edge(tmp_path: Path):
+    """Golden rule: SharePoint CreateFile with dataset = expression
+    does NOT emit writes_to edge nor SharePointSite: node.
+
+    Tests the @-startswith guard on 'dataset' parameter of CreateFile (sharepointonline)."""
+    definition = {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "CreateFile": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_sharepointonline",
+                        "operationId": "CreateFile",
+                    },
+                    "parameters": {
+                        "dataset": "@outputs('Compose_Site')?['siteId']",  # EXPRESSION
+                        "folderPath": "/Shared Documents",
+                        "name": "NewFile.txt",
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "SharePoint_Dataset_Expr", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: SharePoint_Dataset_Expr")
+
+    # No writes_to edge from flow to a SharePointSite
+    writes_edges = [e for e in res["edges"]
+                    if e["source"] == flow_id and e["relation"] == "writes_to"]
+    target_labels = [by_id.get(e["target"], "") for e in writes_edges]
+    sharepoint_writes = [l for l in target_labels if l.startswith("SharePointSite:")]
+    assert not sharepoint_writes, f"Unexpected SharePointSite writes_to found: {sharepoint_writes}"
+
+    # No SharePointSite: nodes should exist
+    labels = {n["label"] for n in res["nodes"]}
+    sharepoint_nodes = [l for l in labels if l.startswith("SharePointSite:")]
+    assert not sharepoint_nodes, f"Unexpected SharePointSite nodes found: {sharepoint_nodes}"
+
+
+def test_powerautomate_same_form_triggers_and_reads_omits_reads_from(tmp_path: Path):
+    """Form A both triggers Flow Y and is read by Flow Y: emit only triggers, suppress reads_from.
+
+    Real case from 4 UCMA flows: CreateFormWebhook (trigger) + GetFormResponseById (action)
+    on the SAME form. In a non-directed graph, two aristas between the same pair collapse
+    to one. Rule: emit triggers (direction matters), suppress reads_from.
+
+    This test verifies exactly one edge exists and it is triggers."""
+    definition = {
+        "triggers": {
+            "form_trigger": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "CreateFormWebhook",
+                    },
+                    "parameters": {
+                        "form_id": "survey-uuid-abc123",
+                    },
+                },
+            },
+        },
+        "actions": {
+            "GetResponse": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "GetFormResponseById",
+                    },
+                    "parameters": {
+                        "form_id": "survey-uuid-abc123",  # SAME form
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Form_Trigger_And_Read", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Form_Trigger_And_Read")
+    form_id = next((n["id"] for n in res["nodes"] if n["label"] == "Form: survey-uuid-abc123"), None)
+
+    assert form_id is not None, "Form node not found"
+
+    # Find all edges between Form and Flow
+    form_flow_edges = [e for e in res["edges"]
+                       if (e["source"] == form_id and e["target"] == flow_id) or
+                          (e["source"] == flow_id and e["target"] == form_id)]
+
+    # Should be exactly ONE edge
+    assert len(form_flow_edges) == 1, f"Expected 1 edge between Form and Flow, got {len(form_flow_edges)}"
+
+    # That edge must be triggers with Form as source, Flow as target
+    edge = form_flow_edges[0]
+    assert edge["relation"] == "triggers", f"Expected relation 'triggers', got '{edge['relation']}'"
+    assert edge["source"] == form_id, "triggers edge must originate from Form"
+    assert edge["target"] == flow_id, "triggers edge must point to Flow"
+
+    # No reads_from edge should exist
+    reads_edges = [e for e in res["edges"]
+                   if e["relation"] == "reads_from" and
+                      ((e["source"] == flow_id and e["target"] == form_id) or
+                       (e["source"] == form_id and e["target"] == flow_id))]
+    assert not reads_edges, f"Unexpected reads_from edge found between Form and Flow"
+
+
+def test_powerautomate_different_forms_trigger_and_read_both_exist(tmp_path: Path):
+    """Form A triggers Flow Y, Form B is read by Flow Y: both aristas must exist.
+
+    Verifies that the suppression of reads_from only applies when it's the SAME form
+    that triggers and is read. Different forms should emit both edges.
+
+    Without this test, someone could "fix" the graph by removing all reads_from
+    edges from Forms, and the first test would still pass."""
+    definition = {
+        "triggers": {
+            "form_trigger": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "CreateFormWebhook",
+                    },
+                    "parameters": {
+                        "form_id": "form-A-uuid",
+                    },
+                },
+            },
+        },
+        "actions": {
+            "GetResponseB": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_microsoftforms",
+                        "operationId": "GetFormResponseById",
+                    },
+                    "parameters": {
+                        "form_id": "form-B-uuid",  # DIFFERENT form
+                    },
+                },
+            },
+        },
+    }
+    metadata_path = _make_flow(tmp_path, "Form_A_Triggers_B_Read", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Form_A_Triggers_B_Read")
+    form_a_id = next((n["id"] for n in res["nodes"] if n["label"] == "Form: form-A-uuid"), None)
+    form_b_id = next((n["id"] for n in res["nodes"] if n["label"] == "Form: form-B-uuid"), None)
+
+    assert form_a_id is not None, "Form A node not found"
+    assert form_b_id is not None, "Form B node not found"
+
+    # Find triggers edge: Form A -> Flow
+    triggers_edges = [e for e in res["edges"]
+                      if e["source"] == form_a_id and e["target"] == flow_id and e["relation"] == "triggers"]
+    assert len(triggers_edges) == 1, f"Expected 1 triggers edge from Form A to Flow, got {len(triggers_edges)}"
+
+    # Find reads_from edge: Flow -> Form B
+    reads_edges = [e for e in res["edges"]
+                   if e["source"] == flow_id and e["target"] == form_b_id and e["relation"] == "reads_from"]
+    assert len(reads_edges) == 1, f"Expected 1 reads_from edge from Flow to Form B, got {len(reads_edges)}"
+
+    # Both edges exist and have different relations: triggers and reads_from
+    assert triggers_edges[0]["relation"] == "triggers"
+    assert reads_edges[0]["relation"] == "reads_from"
