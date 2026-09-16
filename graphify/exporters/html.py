@@ -83,6 +83,7 @@ def _html_styles() -> str:
   #lineage-wrap { display: none; flex: 1; flex-direction: column; overflow-y: auto; padding: 12px; border-top: 1px solid #2a2a4e; }
   #lineage-wrap h3 { font-size: 13px; color: #aaa; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
   #lineage-wrap h3 span { color: #e0e0e0; text-transform: none; letter-spacing: normal; }
+  #lineage-hint { font-size: 11px; color: #666; margin-bottom: 8px; line-height: 1.4; }
   #lineage-exit-btn { display: block; width: 100%; margin-bottom: 10px; background: transparent; border: 1px dashed #888; color: #ccc; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
   #lineage-exit-btn:hover { border-color: #4E79A7; color: #fff; }
   .lineage-hop { display: flex; align-items: center; gap: 6px; padding: 4px 6px; margin: 2px 0; border-left: 3px solid #333; border-radius: 3px; cursor: pointer; }
@@ -554,47 +555,59 @@ def _patterns_script() -> str:
 
 
 def _lineage_script() -> str:
-    """Trace-lineage panel: from a selected node, follow directed edges both
-    forward (downstream — where the data goes) and backward (upstream — where
-    it came from) and render just that chain, instead of the whole graph.
+    """Trace-lineage panel: from a selected node, reveal its DIRECT (one-hop)
+    upstream and downstream neighbors, instead of walking the whole
+    transitive chain and rendering it all at once.
 
-    Two things make a full-graph render useless for answering "where does this
-    data come from / end up, and what filters it along the way": (1) it is
-    still every OTHER node and edge in the corpus, competing for attention and
-    physics-simulation time, and (2) `reads_from`/`writes_to`/`contains`/
-    `displays_measure`-style edges already encode direction ("arrows follow
-    the sense of the data", per the exporter's own edge-direction fix #563) —
-    a chain like origin -> dataflow -> staging table -> stored procedure ->
-    warehouse table -> semantic model -> measure -> report visual is already
-    *in* the graph, just buried under everything unrelated to it.
+    An earlier version walked every direction to depth 15 and rendered the
+    full transitive closure in one shot. On a real ETL/BI graph that is not a
+    clean single chain — a table read by a dozen procedures, a report page
+    reached by a dozen visuals — so one click could pull in hundreds of nodes
+    across branches the user never asked to see, which is unreadable rather
+    than useful (a full multi-hop trace exchanged one large graph for another,
+    smaller but still uninterpretable, one). Expansion is now one hop at a
+    time and user-driven: clicking "Trace lineage" on a node adds only ITS
+    direct neighbors to the canvas; clicking the button again on one of those
+    newly-revealed nodes extends the picture from there. The user decides
+    which branch is worth following instead of being shown all of them.
+
+    Two things still make a full-graph render useless for answering "where
+    does this data come from / end up, and what filters it along the way":
+    (1) it is every OTHER node and edge in the corpus, competing for
+    attention and physics-simulation time, and (2) `reads_from`/`writes_to`/
+    `contains`/`displays_measure`-style edges already encode direction
+    ("arrows follow the sense of the data", per the exporter's own
+    edge-direction fix #563) — the chain is already *in* the graph, just
+    buried under everything unrelated to it.
 
     Generic on purpose (no relation name is hardcoded to any one domain): the
-    walk follows every outgoing/incoming edge regardless of its `relation`
-    label, since graphify serves any language/any repo and a lineage-shaped
-    corpus (ETL/BI, build pipelines, data contracts) is only one case of many.
-    The one exception is display: an edge whose relation name contains
-    "filter" (e.g. a Power BI `filters_by_column` slicer/report filter) is
-    highlighted amber in both the redrawn graph and the text list, since a
-    filter applied partway down a chain silently changes what the destination
-    node actually shows — exactly the kind of hop a plain neighbor list buries
-    among ordinary data-movement edges.
+    one-hop expansion follows every outgoing/incoming edge regardless of its
+    `relation` label, since graphify serves any language/any repo and a
+    lineage-shaped corpus (ETL/BI, build pipelines, data contracts) is only
+    one case of many. The one exception is display: an edge whose relation
+    name contains "filter" (e.g. a Power BI `filters_by_column` slicer/report
+    filter) is highlighted amber in both the redrawn graph and the text list,
+    since a filter applied partway down a chain silently changes what the
+    destination node actually shows — exactly the kind of hop a plain
+    neighbor list buries among ordinary data-movement edges.
 
     Rendering reuses the SAME `nodesDS`/`network` instance the main graph
-    uses (hide-everything-but-the-chain, matching `applyPattern`'s technique)
-    rather than standing up a second vis.Network: vis-network already drops
-    edges whose endpoint node is hidden, so no separate edge-visibility
-    bookkeeping is needed, and the existing legend/community sync in
-    `applyPattern` comes for free when the patterns panel is present (skipped,
-    with a manual fallback, in the aggregated community view where it isn't).
+    uses (hide-everything-but-the-visible-set, matching `applyPattern`'s
+    technique) rather than standing up a second vis.Network: vis-network
+    already drops edges whose endpoint node is hidden, so no separate
+    edge-visibility bookkeeping is needed, and the existing legend/community
+    sync in `applyPattern` comes for free when the patterns panel is present
+    (skipped, with a manual fallback, in the aggregated community view where
+    it isn't).
     """
     return """<script>
 (function() {
   const byIdLineage = new Map(RAW_NODES.map(n => [n.id, n]));
-  // Adjacency keyed by the EDGE'S OWN endpoint role, not traversal direction:
-  // outAdj[x] lists edges where x is the source (used for the downstream
-  // walk), inAdj[x] lists edges where x is the target (used for the upstream
-  // walk). RAW_EDGES' from/to already carry the true logical direction
-  // (restored via _src/_tgt by the Python side), so no re-derivation here.
+  // Adjacency keyed by the EDGE'S OWN endpoint role: outAdj[x] lists edges
+  // where x is the source (x's downstream neighbors), inAdj[x] lists edges
+  // where x is the target (x's upstream neighbors). RAW_EDGES' from/to
+  // already carry the true logical direction (restored via _src/_tgt by the
+  // Python side), so no re-derivation here.
   const outAdj = new Map();
   const inAdj = new Map();
   RAW_EDGES.forEach((e, i) => {
@@ -604,39 +617,20 @@ def _lineage_script() -> str:
     inAdj.get(e.to).push(i);
   });
 
-  // Long enough to cover a realistic ETL/BI chain (source -> landing ->
-  // staging -> procedure -> warehouse table -> semantic model -> measure ->
-  // visual -> page -> report is ~10 hops) with headroom; the walk stops
-  // early on its own once a direction runs out of unvisited neighbors.
-  const LINEAGE_MAX_DEPTH = 15;
-
   function isFilterRelation(rel) {
     return /filter/i.test(rel || '');
   }
 
-  // `forward`: true walks outAdj toward each edge's `to` (downstream); false
-  // walks inAdj toward each edge's `from` (upstream). Returns hop distance
-  // per visited node, positive downstream / negative upstream / 0 = start.
-  function walk(adj, startId, forward) {
-    const dist = new Map([[startId, 0]]);
-    let frontier = [startId];
-    for (let d = 1; d <= LINEAGE_MAX_DEPTH && frontier.length; d++) {
-      const next = [];
-      frontier.forEach(nid => {
-        (adj.get(nid) || []).forEach(ei => {
-          const other = forward ? RAW_EDGES[ei].to : RAW_EDGES[ei].from;
-          if (!dist.has(other)) {
-            dist.set(other, forward ? d : -d);
-            next.push(other);
-          }
-        });
-      });
-      frontier = next;
-    }
-    return dist;
+  function directNeighbors(id) {
+    const ids = new Set();
+    (outAdj.get(id) || []).forEach(ei => ids.add(RAW_EDGES[ei].to));
+    (inAdj.get(id) || []).forEach(ei => ids.add(RAW_EDGES[ei].from));
+    return ids;
   }
 
   let lineageActive = false;
+  let lineageRoot = null;
+  let visibleIds = new Set();
   let originalEdgeStyles = null;
 
   function restoreEdgeStyles() {
@@ -649,6 +643,8 @@ def _lineage_script() -> str:
   function exitLineage() {
     if (!lineageActive) return;
     lineageActive = false;
+    lineageRoot = null;
+    visibleIds = new Set();
     restoreEdgeStyles();
     if (window.__clearActivePattern) window.__clearActivePattern();
     toggleAllCommunities(false);
@@ -660,36 +656,43 @@ def _lineage_script() -> str:
     document.getElementById('legend-wrap').style.display = '';
   }
 
-  function traceLineage(startId) {
-    const startNode = byIdLineage.get(startId);
-    if (!startNode) return;
-    restoreEdgeStyles();
-    lineageActive = true;
-
-    const downDist = walk(outAdj, startId, true);
-    const dist = new Map(downDist);
-    walk(inAdj, startId, false).forEach((d, nid) => {
-      if (!dist.has(nid)) dist.set(nid, d);
-    });
-    const idSet = new Set(dist.keys());
-
-    if (window.applyPattern) {
-      // Also syncs the community legend and does an initial fit — the
-      // hierarchical re-layout below fits again once positions settle.
-      window.applyPattern(idSet, null);
-    } else {
-      nodesDS.update(RAW_NODES.map(n => ({ id: n.id, hidden: !idSet.has(n.id) })));
+  // Hop distance from the root, recomputed over just the currently-visible
+  // set on every expansion (cheap: it stays small). Nodes added by expanding
+  // from a DIFFERENT node than the root (the user followed a second branch)
+  // may be unreachable from the root within the visible set alone — those
+  // render with no distance rather than a wrong one.
+  function distancesFromRoot() {
+    const dist = new Map([[lineageRoot, 0]]);
+    let frontier = [lineageRoot];
+    while (frontier.length) {
+      const next = [];
+      frontier.forEach(nid => {
+        (outAdj.get(nid) || []).forEach(ei => {
+          const other = RAW_EDGES[ei].to;
+          if (visibleIds.has(other) && !dist.has(other)) { dist.set(other, dist.get(nid) + 1); next.push(other); }
+        });
+        (inAdj.get(nid) || []).forEach(ei => {
+          const other = RAW_EDGES[ei].from;
+          if (visibleIds.has(other) && !dist.has(other)) { dist.set(other, dist.get(nid) - 1); next.push(other); }
+        });
+      });
+      frontier = next;
     }
+    return dist;
+  }
 
-    // The induced subgraph over the visited nodes — not just the BFS
-    // traversal tree — so a lateral edge between two chain nodes (e.g. two
-    // sibling stored procedures both reading the same staging table) still
-    // renders, matching how the MCP query engine treats a traversal result.
+  function renderLineagePanel() {
+    const dist = distancesFromRoot();
+
+    // The induced subgraph over the visible nodes — not just the edges that
+    // caused an expansion — so a lateral edge between two visible nodes (two
+    // sibling procedures both reading the same staging table) still renders.
     const inducedEdgeIdxs = [];
     RAW_EDGES.forEach((e, i) => {
-      if (dist.has(e.from) && dist.has(e.to)) inducedEdgeIdxs.push(i);
+      if (visibleIds.has(e.from) && visibleIds.has(e.to)) inducedEdgeIdxs.push(i);
     });
 
+    restoreEdgeStyles();
     const styleUpdates = [];
     originalEdgeStyles = [];
     inducedEdgeIdxs.forEach(i => {
@@ -701,25 +704,17 @@ def _lineage_script() -> str:
     });
     if (styleUpdates.length) edgesDS.update(styleUpdates);
 
-    network.setOptions({
-      physics: { enabled: false },
-      layout: { hierarchical: { enabled: true, direction: 'LR', sortMethod: 'directed', levelSeparation: 220, nodeSpacing: 90, treeSpacing: 140 } },
-    });
-    setTimeout(() => network.fit({ nodes: Array.from(idSet), animation: { duration: 400, easingFunction: 'easeInOutQuad' } }), 60);
-
-    const patternsWrap = document.getElementById('patterns-wrap');
-    if (patternsWrap) patternsWrap.style.display = 'none';
-    document.getElementById('legend-wrap').style.display = 'none';
-    const wrap = document.getElementById('lineage-wrap');
-    wrap.style.display = 'flex';
-    document.getElementById('lineage-title').textContent = startNode.label;
-
-    const ordered = Array.from(dist.entries()).sort((a, b) => a[1] - b[1]);
+    document.getElementById('lineage-title').textContent = byIdLineage.get(lineageRoot).label;
+    const ordered = Array.from(visibleIds)
+      .map(nid => [nid, dist.has(nid) ? dist.get(nid) : null])
+      .sort((a, b) => (a[1] ?? 0) - (b[1] ?? 0));
     document.getElementById('lineage-chain').innerHTML = ordered.map(([nid, d]) => {
       const n = byIdLineage.get(nid);
       if (!n) return '';
-      const marker = nid === startId ? '&#9679;' : (d < 0 ? '&#8593;' : '&#8595;');
-      const distLabel = d === 0 ? 'selected' : (d < 0 ? `${-d} upstream` : `${d} downstream`);
+      const marker = nid === lineageRoot ? '&#9679;' : (d == null ? '&#8226;' : (d < 0 ? '&#8593;' : '&#8595;'));
+      const distLabel = nid === lineageRoot ? 'selected'
+        : d == null ? 'connected'
+        : d < 0 ? `${-d} upstream` : `${d} downstream`;
       return `<div class="lineage-hop" data-nid="${esc(nid)}" style="border-left-color:${esc(n.color.background)}">` +
         `<span class="lineage-hop-marker">${marker}</span>` +
         `<span class="lineage-hop-label">${esc(n.label)}</span>` +
@@ -736,6 +731,43 @@ def _lineage_script() -> str:
       return `<div class="lineage-edge${filter ? ' filter' : ''}">` +
         `${filter ? '&#128269; ' : ''}${esc(fromN.label)} <b>&rarr;${e.label ? ' ' + esc(e.label) : ''} &rarr;</b> ${esc(toN.label)}${ctx}</div>`;
     }).join('');
+  }
+
+  // Expand ONE hop from `id`: starts a fresh session (id + its direct
+  // neighbors only) if none is active yet, otherwise adds id's direct
+  // neighbors to whatever is already visible — the partial, click-driven
+  // expansion this panel is built around.
+  function traceLineage(id) {
+    const node = byIdLineage.get(id);
+    if (!node) return;
+
+    if (!lineageActive) {
+      lineageActive = true;
+      lineageRoot = id;
+      visibleIds = new Set([id]);
+    }
+    directNeighbors(id).forEach(nid => visibleIds.add(nid));
+
+    if (window.applyPattern) {
+      // Also syncs the community legend and does an initial fit — the
+      // hierarchical re-layout below fits again once positions settle.
+      window.applyPattern(visibleIds, null);
+    } else {
+      nodesDS.update(RAW_NODES.map(n => ({ id: n.id, hidden: !visibleIds.has(n.id) })));
+    }
+
+    network.setOptions({
+      physics: { enabled: false },
+      layout: { hierarchical: { enabled: true, direction: 'LR', sortMethod: 'directed', levelSeparation: 220, nodeSpacing: 90, treeSpacing: 140 } },
+    });
+    setTimeout(() => network.fit({ nodes: Array.from(visibleIds), animation: { duration: 400, easingFunction: 'easeInOutQuad' } }), 60);
+
+    const patternsWrap = document.getElementById('patterns-wrap');
+    if (patternsWrap) patternsWrap.style.display = 'none';
+    document.getElementById('legend-wrap').style.display = 'none';
+    document.getElementById('lineage-wrap').style.display = 'flex';
+
+    renderLineagePanel();
   }
 
   document.addEventListener('click', e => {
@@ -1071,6 +1103,7 @@ def to_html(
   </div>
   <div id="lineage-wrap">
     <h3>Lineage: <span id="lineage-title"></span></h3>
+    <div id="lineage-hint">Direct connections only — click "Trace lineage" on another node below to expand further.</div>
     <button id="lineage-exit-btn">&#8630; Back to full graph</button>
     <div id="lineage-chain"></div>
     <div id="lineage-edges-title">Relations</div>
