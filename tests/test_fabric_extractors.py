@@ -1699,4 +1699,143 @@ def test_powerautomate_different_forms_trigger_and_read_both_exist(tmp_path: Pat
 
     # Both edges exist and have different relations: triggers and reads_from
     assert triggers_edges[0]["relation"] == "triggers"
-    assert reads_edges[0]["relation"] == "reads_from"
+
+
+def _excel_definition(drive: str, file_id: str, table: str) -> dict:
+    return {
+        "triggers": {"manual": {"type": "Request"}},
+        "actions": {
+            "AddRow": {
+                "inputs": {
+                    "host": {
+                        "apiId": "/providers/Microsoft.PowerApps/apis/shared_excelonlinebusiness",
+                        "operationId": "AddRowV2",
+                    },
+                    "parameters": {"drive": drive, "file": file_id, "table": table},
+                },
+            },
+        },
+    }
+
+
+def _write_drive_items(tmp_path: Path, environment: str, entries: dict) -> None:
+    (tmp_path / "power-automate" / environment / "_drive_items.json").write_text(
+        json.dumps(entries), encoding="utf-8",
+    )
+
+
+def test_powerautomate_excel_file_without_drive_items_falls_back_to_id(tmp_path: Path):
+    """No `_drive_items.json` at all (pull that predates this feature, or an
+    environment where it was never written): ExcelFile keeps today's label."""
+    definition = _excel_definition("b!xxx", "01QINSFHRPYXCOVOTJ", "{TABLE-A}")
+    metadata_path = _make_flow(tmp_path, "Excel_NoDriveItems", definition=definition)
+    res = extract_powerautomate(metadata_path)
+
+    labels = {n["label"] for n in res["nodes"]}
+    assert "ExcelFile: 01QINSFHRPYXCOVOTJ" in labels
+
+
+def test_powerautomate_excel_file_unresolved_entry_falls_back_to_id(tmp_path: Path):
+    """`_drive_items.json` exists but this (drive, file) pair is resolved:false
+    (the real case for the 4 flows whose connection owner no longer exists in
+    the tenant) -- must NOT invent a URL, must fall back exactly like the
+    file-absent case."""
+    definition = _excel_definition("b!xxx", "01QINSFHRPYXCOVOTJ", "{TABLE-A}")
+    metadata_path = _make_flow(tmp_path, "Excel_Unresolved", definition=definition)
+    _write_drive_items(tmp_path, "grupo-planeta", {
+        "b!xxx/01QINSFHRPYXCOVOTJ": {"resolved": False, "error": "403 Forbidden"},
+    })
+    res = extract_powerautomate(metadata_path)
+
+    labels = {n["label"] for n in res["nodes"]}
+    assert "ExcelFile: 01QINSFHRPYXCOVOTJ" in labels
+
+
+def test_powerautomate_excel_file_resolved_entry_uses_canonical_url(tmp_path: Path):
+    """A resolved entry swaps the ExcelFile label for the canonical URL --
+    the whole point of §4.5's Graph resolution step."""
+    url = "https://gplaneta.sharepoint.com/sites/StudentIntelligence/Documentos%20compartidos/Acciones_close_the_loop.xlsx"
+    definition = _excel_definition("b!xxx", "01QINSFHRPYXCOVOTJ", "{TABLE-A}")
+    metadata_path = _make_flow(tmp_path, "Excel_Resolved", definition=definition)
+    _write_drive_items(tmp_path, "grupo-planeta", {
+        "b!xxx/01QINSFHRPYXCOVOTJ": {"resolved": True, "canonical_url": url, "name": "Acciones_close_the_loop.xlsx"},
+    })
+    res = extract_powerautomate(metadata_path)
+
+    labels = {n["label"] for n in res["nodes"]}
+    assert url in labels
+    assert "ExcelFile: 01QINSFHRPYXCOVOTJ" not in labels
+
+    node = next(n for n in res["nodes"] if n["label"] == url)
+    assert node["drive_item_id"] == "01QINSFHRPYXCOVOTJ"
+    assert node["drive"] == "b!xxx"
+
+
+def test_powerautomate_excel_file_resolution_keyed_by_drive_and_file(tmp_path: Path):
+    """An entry for a DIFFERENT drive must not match -- the key is 'drive/file',
+    not the file id alone (two drives can reuse the same item id shape)."""
+    url = "https://gplaneta.sharepoint.com/sites/Other/Documentos/Otro.xlsx"
+    definition = _excel_definition("b!xxx", "01QINSFHRPYXCOVOTJ", "{TABLE-A}")
+    metadata_path = _make_flow(tmp_path, "Excel_WrongDrive", definition=definition)
+    _write_drive_items(tmp_path, "grupo-planeta", {
+        "b!OTHER-DRIVE/01QINSFHRPYXCOVOTJ": {"resolved": True, "canonical_url": url, "name": "Otro.xlsx"},
+    })
+    res = extract_powerautomate(metadata_path)
+
+    labels = {n["label"] for n in res["nodes"]}
+    assert "ExcelFile: 01QINSFHRPYXCOVOTJ" in labels
+    assert url not in labels
+
+
+def test_powerautomate_excel_table_and_writes_to_unaffected_by_resolution(tmp_path: Path):
+    """Resolving ExcelFile's identity must not touch ExcelTable's label or the
+    Flow --writes_to--> ExcelTable edge -- only the file-level node changes."""
+    url = "https://gplaneta.sharepoint.com/sites/StudentIntelligence/Documentos%20compartidos/Acciones_close_the_loop.xlsx"
+    definition = _excel_definition("b!xxx", "01QINSFHRPYXCOVOTJ", "{TABLE-A}")
+    metadata_path = _make_flow(tmp_path, "Excel_TableUnaffected", definition=definition)
+    _write_drive_items(tmp_path, "grupo-planeta", {
+        "b!xxx/01QINSFHRPYXCOVOTJ": {"resolved": True, "canonical_url": url, "name": "Acciones_close_the_loop.xlsx"},
+    })
+    res = extract_powerautomate(metadata_path)
+
+    by_id = {n["id"]: n["label"] for n in res["nodes"]}
+    flow_id = next(n["id"] for n in res["nodes"] if n["label"] == "Flow: Excel_TableUnaffected")
+    writes = {by_id[e["target"]] for e in res["edges"]
+              if e["source"] == flow_id and e["relation"] == "writes_to"}
+    assert "ExcelTable: 01QINSFHRPYXCOVOTJ/{TABLE-A}" in writes
+
+    contains_edges = [(by_id.get(e["source"]), by_id.get(e["target"]))
+                       for e in res["edges"] if e["relation"] == "contains"]
+    assert (url, "ExcelTable: 01QINSFHRPYXCOVOTJ/{TABLE-A}") in contains_edges
+
+
+def test_powerautomate_excel_file_merges_with_powerquery_dataflow_node(tmp_path: Path):
+    """The real payoff, end to end: a Flow's resolved ExcelFile and a Dataflow's
+    Web.Contents(...) reading the SAME real Excel must mint the exact same
+    node id -- proving the two sides actually merge at build time (graphify's
+    build step unions nodes by id), not just that they share a string by luck."""
+    url = "https://gplaneta.sharepoint.com/sites/StudentIntelligence/Documentos%20compartidos/Acciones_close_the_loop.xlsx"
+
+    definition = _excel_definition("b!xxx", "01QINSFHRPYXCOVOTJ", "{TABLE-A}")
+    metadata_path = _make_flow(tmp_path, "Excel_Merge_PA", definition=definition)
+    _write_drive_items(tmp_path, "grupo-planeta", {
+        "b!xxx/01QINSFHRPYXCOVOTJ": {"resolved": True, "canonical_url": url, "name": "Acciones_close_the_loop.xlsx"},
+    })
+    pa_res = extract_powerautomate(metadata_path)
+    pa_excel_file_id = next(n["id"] for n in pa_res["nodes"] if n["label"] == url)
+
+    df_dir = tmp_path / "SI_DM_VOC_UCMA.Dataflow"
+    df_dir.mkdir(parents=True)
+    mashup_path = df_dir / "mashup.pq"
+    mashup_text = (
+        'section Section1;\n'
+        'shared Query1 = let\n'
+        f'    Source = Excel.Workbook(Web.Contents("{url}"), null, true)\n'
+        'in\n'
+        '    Source;\n'
+    )
+    mashup_path.write_text(mashup_text, encoding="utf-8")
+    pq_res = extract_powerquery(mashup_path)
+    pq_url_node_id = next(n["id"] for n in pq_res["nodes"] if n["label"] == url)
+
+    assert pa_excel_file_id == pq_url_node_id

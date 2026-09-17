@@ -17,6 +17,15 @@ at write time):
 - §4.5 Excel: `Flow --reads_from/writes_to--> ExcelTable: <file>/<table>` from
   `shared_excelonlinebusiness` GetItems/GetItem (reads) and AddRowV2 (writes).
   Also: `ExcelFile: <file> --contains--> ExcelTable: <file>/<table>`.
+  When the environment's `_drive_items.json` (written by `pa_pull.ipynb`'s Graph
+  resolution step, sibling of `_connections.json`) has a resolved entry for a
+  flow's `(drive, file)` pair, the `ExcelFile` node is minted using the
+  resolved canonical URL as its label instead of the bare drive-item id — the
+  SAME label `graphify.extractors.powerquery` mints from a Dataflow's
+  `Web.Contents("https://...")` reading that same Excel file, so the two sides
+  merge into one node instead of staying disconnected islands. Falls back to
+  `ExcelFile: <file>` when unresolved (e.g. `_drive_items.json` absent, or the
+  pull's identity couldn't reach that particular OneDrive/SharePoint item).
 - §4.5 Forms: `Form: <form_id> --triggers--> Flow` from `shared_microsoftforms`
   CreateFormWebhook triggers, and `Flow --reads_from--> Form: <form_id>` from
   GetFormResponseById actions.
@@ -424,6 +433,36 @@ def extract_powerautomate(path: Path, content: str | bytes | None = None) -> dic
         },
     )
 
+    # ---- §4.5 Excel: resolve ExcelFile identity against _drive_items.json ----
+    # Environment-level file written by pa_pull.ipynb's Graph resolution step
+    # (sibling of `_connections.json`). Read as a SIBLING, same pattern as the
+    # connections catalogue below: a missing/malformed file just means no
+    # (drive, file) pair resolves, never an error for this extraction.
+    drive_items: dict[str, Any] = {}
+    drive_items_path = flow_dir.parent / "_drive_items.json"
+    try:
+        if drive_items_path.exists():
+            loaded_drive_items = json.loads(_read_text_safe(drive_items_path))
+            if isinstance(loaded_drive_items, dict):
+                drive_items = loaded_drive_items
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    def _excel_file_identity(drive: str, file_id: str) -> tuple[str, dict[str, Any]]:
+        """Label/extra to mint the `ExcelFile: <file_id>` node with.
+
+        A resolved `_drive_items.json` entry for this (drive, file) pair means
+        the label becomes the canonical URL instead — the same string
+        `powerquery.extract_powerquery` mints from `Web.Contents(...)` for the
+        Dataflow reading this same Excel file, so `_make_id()` collides and the
+        two sides merge into one node at build time.
+        """
+        entry = drive_items.get(f"{drive}/{file_id}")
+        if (isinstance(entry, dict) and entry.get("resolved")
+                and isinstance(entry.get("canonical_url"), str) and entry["canonical_url"]):
+            return entry["canonical_url"], {"drive_item_id": file_id, "drive": drive}
+        return f"ExcelFile: {file_id}", {}
+
     # ---- §4.1 SQL: Flow --reads_from/writes_to--> esquema.tabla ----
     # §4.5 Excel: Flow --reads_from/writes_to--> ExcelTable: <file>/<table>
     # §4.5 Forms: Form: <form_id> --triggers--> Flow (§4.5 trigger)
@@ -520,7 +559,8 @@ def extract_powerautomate(path: Path, content: str | bytes | None = None) -> dic
                                         extra_attrs["source"] = source
                                     table_nid = _ref_stub(f"ExcelTable: {file_id}/{table}",
                                                         extra=extra_attrs)
-                                    file_nid = _ref_stub(f"ExcelFile: {file_id}")
+                                    excel_file_label, excel_file_extra = _excel_file_identity(drive, file_id)
+                                    file_nid = _ref_stub(excel_file_label, extra=excel_file_extra)
                                     dedup_key = (flow_nid, "writes_to", table_nid)
                                     if dedup_key not in dedup_edges:
                                         dedup_edges[dedup_key] = f"excel action={action_name}"
@@ -542,7 +582,8 @@ def extract_powerautomate(path: Path, content: str | bytes | None = None) -> dic
                                         extra_attrs["source"] = source
                                     table_nid = _ref_stub(f"ExcelTable: {file_id}/{table}",
                                                         extra=extra_attrs)
-                                    file_nid = _ref_stub(f"ExcelFile: {file_id}")
+                                    excel_file_label, excel_file_extra = _excel_file_identity(drive, file_id)
+                                    file_nid = _ref_stub(excel_file_label, extra=excel_file_extra)
                                     dedup_key = (flow_nid, "reads_from", table_nid)
                                     if dedup_key not in dedup_edges:
                                         dedup_edges[dedup_key] = f"excel action={action_name}"
