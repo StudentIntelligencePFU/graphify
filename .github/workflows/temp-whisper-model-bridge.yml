@@ -1,0 +1,33 @@
+name: Temp Whisper model bridge
+
+on:
+  push:
+    branches:
+      - tmp-chatgpt-whisper-model-20261014
+    paths:
+      - '.github/workflows/temp-whisper-model-bridge.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-model:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download multilingual Whisper tiny q5_1
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 4 --retry-delay 2 \
+            -o ggml-tiny-q5_1.bin \
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny-q5_1.bin
+          echo "818710568da3ca15689e31a743197b520007872ff9576237bda97bd1b469c3d7  ggml-tiny-q5_1.bin" | sha256sum -c -
+          ls -lh ggml-tiny-q5_1.bin
+
+      - name: Upload model
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-tiny-q5_1
+          path: ggml-tiny-q5_1.bin
+          retention-days: 1
+          if-no-files-found: error
