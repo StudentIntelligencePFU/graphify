@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - tmp-chatgpt-whisper-model-20261014
-    paths:
-      - '.github/workflows/temp-whisper-model-bridge.yml'
 
 permissions:
   contents: read
